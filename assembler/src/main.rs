@@ -1,105 +1,11 @@
-use std::{borrow::Cow, collections::HashMap, fmt, fs};
+mod instructions;
+use instructions::*;
+
+use std::{collections::HashMap, fmt, fs, iter};
 
 use byteorder::{BigEndian, WriteBytesExt};
 use clap::Parser;
 use tree_sitter::{Node, Point};
-
-macro_rules! instructions {
-    ($callback:ident$(!($($head:tt)*))?) => {
-        $callback! { $($($head)*;)?
-            NOP,
-            HLT,
-
-            IN(dest:reg, src:port),
-            OUT(dest:port, src:val),
-
-            CAL(dest:val),
-            RET,
-            PSH(src:val),
-            POP(dest:reg),
-
-            LOD(dest:reg, src:val),
-            LLOD(dest:reg, src1:val, src2:val),
-            STR(dest:val, src:val),
-            LSTR(dest:val, src1:val, src2:val),
-            CPY(dest:val, src:val),
-
-            IMM(dest:reg, src:imm),
-            MOV(dest:reg, src:reg),
-
-            ADD(dest:reg, src1:val, src2:val),
-            SUB(dest:reg, src1:val, src2:val),
-
-            INC(dest:reg, src:val),
-            DEC(dest:reg, src:val),
-            NEG(dest:reg, src:val),
-            NOT(dest:reg, src:val),
-
-            MLT(dest:reg, src1:val, src2:val),
-            DIV(dest:reg, src1:val, src2:val),
-            SDIV(dest:reg, src1:val, src2:val),
-            MOD(dest:reg, src1:val, src2:val),
-            SMOD(dest:reg, src1:val, src2:val),
-
-            AND(dest:reg, src1:val, src2:val),
-            NAND(dest:reg, src1:val, src2:val),
-
-            OR(dest:reg, src1:val, src2:val),
-            NOR(dest:reg, src1:val, src2:val),
-
-            XOR(dest:reg, src1:val, src2:val),
-            XNOR(dest:reg, src1:val, src2:val),
-
-            LSH(dest:reg, src:val),
-            RSH(dest:reg, src:val),
-            SRS(dest:reg, src:val),
-
-            BSL(dest:reg, src1:val, src2:val),
-            BSR(dest:reg, src1:val, src2:val),
-            BSS(dest:reg, src1:val, src2:val),
-
-            JMP(dest:val),
-
-            BRG(dest:val, src1:val, src2:val),
-            BGE(dest:val, src1:val, src2:val),
-            BRL(dest:val, src1:val, src2:val),
-            BLE(dest:val, src1:val, src2:val),
-
-            SBRG(dest:val, src1:val, src2:val),
-            SBGE(dest:val, src1:val, src2:val),
-            SBRL(dest:val, src1:val, src2:val),
-            SBLE(dest:val, src1:val, src2:val),
-
-            BRE(dest:val, src1:val, src2:val),
-            BNE(dest:val, src1:val, src2:val),
-            BRC(dest:val, src1:val, src2:val),
-            BNC(dest:val, src1:val, src2:val),
-
-            BRZ(dest:val, src:val),
-            BNZ(dest:val, src:val),
-
-            BRP(dest:val, src:val),
-            BRN(dest:val, src:val),
-            BOD(dest:val, src:val),
-            BEV(dest:val, src:val),
-
-            SETG(dest:reg, src1:val, src2:val),
-            SETGE(dest:reg, src1:val, src2:val),
-            SETL(dest:reg, src1:val, src2:val),
-            SETLE(dest:reg, src1:val, src2:val),
-
-            SSETG(dest:reg, src1:val, src2:val),
-            SSETGE(dest:reg, src1:val, src2:val),
-            SSETL(dest:reg, src1:val, src2:val),
-            SSETLE(dest:reg, src1:val, src2:val),
-
-            SETE(dest:reg, src1:val, src2:val),
-            SETNE(dest:reg, src1:val, src2:val),
-            SETC(dest:reg, src1:val, src2:val),
-            SETNC(dest:reg, src1:val, src2:val),
-        }
-    };
-}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -166,6 +72,11 @@ impl NodeExt for Node<'_> {
     }
 }
 
+struct SourceError {
+    range: Option<tree_sitter::Range>,
+    message: String,
+}
+
 fn main() {
     let args = Args::parse();
     let source = &fs::read_to_string(&args.input).expect("Failed to read input file");
@@ -176,6 +87,31 @@ fn main() {
     let tree = parser
         .parse(source, None)
         .expect("Error in Parser::parse (unreachable?)");
+
+    let mut errors = Vec::new();
+    macro_rules! err {
+        (@nopush None, $($arg:tt)*) => {
+            err!(@ None, $($arg)*)
+        };
+        (@nopush $node:expr, $($arg:tt)*) => {
+            err!(@ Some($node.range()), $($arg)*)
+        };
+        (@ $range:expr, $($t:tt)*) => {
+            SourceError {
+                range: $range,
+                message: format!($($t)*),
+            }
+        };
+        (None$(; $value:expr)?, $($t:tt)*) => {{
+            errors.push(err!(@nopush None, $($t)*));
+            $($value)?
+        }};
+        ($node:expr$(; $value:expr)?, $($t:tt)*) => {{
+            errors.push(err!(@nopush $node, $($t)*));
+            $($value)?
+        }};
+    }
+
     let dummy = &mut tree.walk();
     let root = tree.root_node();
     let mut minheap = None;
@@ -184,123 +120,146 @@ fn main() {
     for header in root.children_by_field_name("header", dummy) {
         match header.kind() {
             "BITS" => {
-                let value = header
-                    .field("value")
-                    .text(source)
-                    .parse::<usize>()
-                    .expect("Invalid BITS value");
-                match header
-                    .child_by_field_name("comparison")
-                    .map(|node| node.text(source))
-                    .unwrap_or("==")
-                {
-                    "==" => assert!(16 == value, "URCLvm is only 16-bit for now"),
-                    "<=" => assert!(16 <= value, "URCLvm is only 16-bit for now"),
-                    ">=" => assert!(16 >= value, "URCLvm is only 16-bit for now"),
-                    _ => unreachable!("Invalid comparison operator in BITS header"),
-                }
+                let value_field = header.field("value");
+                let value = value_field.text(source).parse::<usize>();
+                match value {
+                    Ok(value) => {
+                        let matches = match header
+                            .child_by_field_name("comparison")
+                            .map(|node| node.text(source))
+                            .unwrap_or("==")
+                        {
+                            "==" => 16 == value,
+                            "<=" => 16 <= value,
+                            ">=" => 16 >= value,
+                            comp => {
+                                unreachable!("Invalid comparison operator in BITS header: {comp}")
+                            }
+                        };
+
+                        if !matches {
+                            err!(header, "URCLvm is only 16-bit for now");
+                        }
+                    }
+                    Err(err) => {
+                        err!(value_field, "Invalid BITS literal: {err}");
+                    }
+                };
             }
             "MINHEAP" => {
-                let value = header
-                    .field("value")
+                let value_field = header.field("value");
+                let value = value_field
                     .text(source)
                     .parse::<u16>()
                     .expect("Invalid MINHEAP value");
                 minheap = match minheap {
-                    Some(old) => panic!("Duplicate MINHEAP header: {old} and {value}"),
+                    Some(old) => {
+                        err!(value_field; Some(old), "Duplicate MINHEAP header: previously set to {old}")
+                    }
                     None => Some(value),
                 }
             }
             "MINSTACK" => {
-                let value = header
-                    .field("value")
+                let value_field = header.field("value");
+                let value = value_field
                     .text(source)
                     .parse::<u16>()
                     .expect("Invalid MINSTACK value");
                 minstack = match minstack {
-                    Some(old) => panic!("Duplicate MINSTACK header: {old} and {value}"),
+                    Some(old) => {
+                        err!(value_field; Some(old), "Duplicate MINSTACK header: previously set to {old}")
+                    }
                     None => Some(value),
                 }
             }
             "MINREG" => {
-                let value = header
-                    .field("value")
+                let value_field = header.field("value");
+                let value = value_field
                     .text(source)
                     .parse::<u16>()
                     .expect("Invalid MINREG value");
                 if value >= 15 {
-                    panic!("MINREG value is too high; URCLvm only has 14 regs and SP");
+                    err!(
+                        value_field,
+                        "MINREG value is too high; URCLvm only has 14 regs and SP"
+                    );
                 }
                 minreg = match minreg {
-                    Some(old) => panic!("Duplicate MINREG header: {old} and {value}"),
+                    Some(old) => {
+                        err!(value_field; Some(old), "Duplicate MINREG header: previously set to {old}")
+                    }
                     None => Some(value),
                 }
             }
-            kind => unreachable!("Unknown header {kind}"),
+            kind => err!(header, "Unknown header {kind}"),
         }
     }
-    let minheap = minheap.expect("Missing MINHEAP header");
-    let minstack = minstack.expect("Missing MINSTACK header");
+    let minheap = minheap.unwrap_or_else(|| err!(None; 0, "Missing MINHEAP header"));
+    let minstack = minstack.unwrap_or_else(|| err!(None; 0, "Missing MINSTACK header"));
     let minreg = minreg.unwrap_or(15);
     let cursor = &mut tree.walk();
     if !cursor.goto_first_child() {
         unreachable!("No children of root node");
     }
 
-    let mut lines = Vec::<Instruction<AnyImmediate>>::new();
+    let mut lines = Vec::new();
     let mut labels = HashMap::<&str, usize>::new();
-    // number
-    // char
-    // char_escape
-    // label
-    // relative
-    // memory
-    // macro
-    // port
-    // placeholder
-    // identifier
-    fn imm_literal<'a>(source: &'a str, len: usize) -> impl Fn(Node<'a>) -> AnyImmediate<'a> {
-        move |node| match node.kind() {
-            "number" => AnyImmediate::Number({
-                let text = node.text(source);
-                if text.starts_with("0x") {
-                    u16::from_str_radix(&text[2..], 16)
-                } else if text.starts_with("0b") {
-                    u16::from_str_radix(&text[2..], 2)
-                } else if text.starts_with("0o") {
-                    u16::from_str_radix(&text[2..], 8)
-                } else {
-                    u16::from_str_radix(text, 10)
-                }.expect("Invalid number literal")
-            }),
-            "char" => AnyImmediate::Char(node.text(source).chars().nth(1).unwrap()),
-            "char_escape" => AnyImmediate::Char(match node.text(source).chars().nth(2).unwrap() {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '\\' => '\\',
-                '\'' => '\'',
-                '0' => '\0',
-                _ => unreachable!("Invalid escape sequence"),
-            }),
-            "label" => AnyImmediate::Label(node.text(source)),
-            "relative" => AnyImmediate::Line(
-                (len as isize
-                    + node.text(source)[1..]
-                        .parse::<isize>()
-                        .expect("Invalid relative address")) as usize,
-            ),
-            "memory" => AnyImmediate::Memory(
-                node.text(source)[1..]
-                    .parse()
-                    .expect("Invalid memory address"),
-            ),
-            "macro" => AnyImmediate::Macro(node.text(source)),
-            "placeholder" => panic!("Placeholder values are not supported"),
-            "identifier" => panic!("Identifiers are not supported"),
-            "register" => unreachable!("Registers should not appear here"),
-            "port" => unreachable!("Ports should not appear here"),
-            kind => unreachable!("Unknown operand kind `{kind}`"),
+
+    fn imm_literal<'a>(
+        source: &'a str,
+        len: usize,
+    ) -> impl Fn(Node<'a>) -> Result<AnyImmediate<'a>, SourceError> {
+        move |node| {
+            Ok(match node.kind() {
+                "number" => AnyImmediate::Number({
+                    let text = node.text(source);
+                    let (text, radix) = if text.starts_with("0x") {
+                        (&text[2..], 16)
+                    } else if text.starts_with("0b") {
+                        (&text[2..], 2)
+                    } else if text.starts_with("0o") {
+                        (&text[2..], 8)
+                    } else {
+                        (text, 10)
+                    };
+                    u16::from_str_radix(text, radix)
+                        .or_else(|_| i16::from_str_radix(text, radix).map(|x| x as u16))
+                        .map_err(|err| err!(@nopush node, "Invalid number literal: {err}"))?
+                }),
+                "char" => AnyImmediate::Char(node.text(source).chars().nth(1).unwrap()),
+                "char_escape" => {
+                    AnyImmediate::Char(match node.text(source).chars().nth(2).unwrap() {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '\\' => '\\',
+                        '\'' => '\'',
+                        '0' => '\0',
+                        _ => unreachable!("Invalid escape sequence"),
+                    })
+                }
+                "label" => AnyImmediate::Label(node.text(source)),
+                "relative" => AnyImmediate::Line(
+                    (len as isize
+                        + node.text(source)[1..]
+                            .parse::<isize>()
+                            .map_err(|err| err!(@nopush node, "Invalid relative address: {err}"))?)
+                        as usize,
+                ),
+                "memory" => AnyImmediate::Memory(
+                    node.text(source)[1..]
+                        .parse()
+                        .map_err(|err| err!(@nopush node, "Invalid memory address: {err}"))?,
+                ),
+                "macro" => AnyImmediate::Macro(node.text(source)),
+                "placeholder" => {
+                    Err(err!(@nopush node, "Please insert a value instead of a placeholder"))?
+                }
+                "identifier" => Err(err!(@nopush node, "Identifiers are not supported"))?,
+                "register" => unreachable!("Registers should not appear here"),
+                "port" => unreachable!("Ports should not appear here"),
+                kind => unreachable!("Unknown operand kind `{kind}`"),
+            })
         }
     }
 
@@ -315,12 +274,25 @@ fn main() {
                 let values = match value.kind() {
                     "array" => value
                         .children_by_field_name("item", dummy)
-                        .map(imm_literal)
+                        .map(|value| imm_literal(value).map(|imm| (value, imm)))
                         .collect(),
-                    "string" => panic!("DW strings are not supported"),
-                    _ => vec![imm_literal(value)],
+                    "string" => vec![Err(err!(@nopush value, "DW strings are not supported"))],
+                    _ => vec![imm_literal(value).map(|imm| (value, imm))],
                 };
-                lines.push(Instruction::DW(values));
+                lines.push(Instruction::DW(
+                    values
+                        .into_iter()
+                        .filter_map(|imm| {
+                            imm.map_or_else(
+                                |err| {
+                                    errors.push(err);
+                                    None
+                                },
+                                Some,
+                            )
+                        })
+                        .collect(),
+                ));
             }
             "instruction" => {
                 for label in cursor.node().children_by_field_name("label", dummy) {
@@ -331,21 +303,41 @@ fn main() {
                     Register(Register),
                     Immediate(AnyImmediate<'a>),
                     Port(Port),
+                    Error,
                 }
                 let operands = cursor
                     .node()
                     .children_by_field_name("operand", dummy)
-                    .map(|operand| match operand.kind() {
-                        "register" => {
-                            AnyOperand::Register(operand.text(source)[1..].try_into().unwrap())
-                        }
-                        "stack_pointer" => AnyOperand::Register(Register::SP),
-                        "program_counter" => panic!("PC unsupported for now"),
-                        "port" => AnyOperand::Port(operand.text(source).try_into().unwrap()),
-                        _ => AnyOperand::Immediate(imm_literal(operand)),
+                    .map(|operand| {
+                        (
+                            operand,
+                            match operand.kind() {
+                                "register" => AnyOperand::Register(
+                                    operand.text(source)[1..].try_into().unwrap(),
+                                ),
+                                "stack_pointer" => AnyOperand::Register(Register::SP),
+                                "program_counter" => {
+                                    err!(operand; AnyOperand::Error, "PC unsupported for now")
+                                }
+                                "port" => {
+                                    AnyOperand::Port(operand.text(source).try_into().unwrap())
+                                }
+                                // could use filter_map here and have this arm return None
+                                // but this preserves operand count, which prevents false-positive incorrect number of args errors
+                                _ => imm_literal(operand).map_or_else(
+                                    |err| {
+                                        errors.push(err);
+                                        AnyOperand::Error
+                                    },
+                                    AnyOperand::Immediate,
+                                ),
+                            },
+                        )
                     })
                     .collect::<Vec<_>>();
                 let opcode = cursor.node().field("name").text(source);
+
+                // when AnyOperand::Error, it has already been handled. don't add anything to errors
                 macro_rules! match_opcodes {
                     (@operands $operands:ident $($name:ident : $type:ident $($tail:tt)*)?) => {
                         $(
@@ -355,30 +347,35 @@ fn main() {
                     };
                     (@operand $name:ident : reg) => {
                         match $name {
-                            AnyOperand::Register(reg) => reg,
-                            AnyOperand::Immediate(_) => panic!("Invalid operand type, expected register, found imm, at {}", cursor.node().pos()),
-                            AnyOperand::Port(_) => panic!("Invalid operand type, expected register, found port, at {}", cursor.node().pos()),
+                            (_, AnyOperand::Register(reg)) => reg,
+                            (node, AnyOperand::Immediate(_)) => err!(node; Register::R0, "Invalid operand type, expected register, found immediate"),
+                            (node, AnyOperand::Port(_)) => err!(node; Register::R0, "Invalid operand type, expected register, found port"),
+                            (_, AnyOperand::Error) => Register::R0,
                         }
                     };
                     (@operand $name:ident : imm) => {
                         match $name {
-                            AnyOperand::Register(_) => panic!("Invalid operand type, expected imm, found register, at {}", cursor.node().pos()),
-                            AnyOperand::Immediate(imm) => imm,
-                            AnyOperand::Port(_) => panic!("Invalid operand type, expected reg or imm, found port, at {}", cursor.node().pos()),
+                            (node, AnyOperand::Register(_)) => err!(node; (node, AnyImmediate::Number(0)), "Invalid operand type, expected immediate, found register"),
+                            (node, AnyOperand::Immediate(imm)) => (node, imm),
+                            (node, AnyOperand::Port(_)) => err!(node; (node, AnyImmediate::Number(0)), "Invalid operand type, expected immediate, found port"),
+                            (node, AnyOperand::Error) => (node, AnyImmediate::Number(0)),
                         }
                     };
                     (@operand $name:ident : port) => {
+                        // fuck it choose some port as the default for errors lol
                         match $name {
-                            AnyOperand::Register(_) => panic!("Invalid operand type, expected port, found reg, at {}", cursor.node().pos()),
-                            AnyOperand::Immediate(_) => panic!("Invalid operand type, expected port, found imm, at {}", cursor.node().pos()),
-                            AnyOperand::Port(port) => port,
+                            (node, AnyOperand::Register(_)) => err!(node; Port::TEXT, "Invalid operand type, expected port, found register"),
+                            (node, AnyOperand::Immediate(_)) => err!(node; Port::TEXT, "Invalid operand type, expected port, found immediate"),
+                            (_, AnyOperand::Port(port)) => port,
+                            (_, AnyOperand::Error) => Port::TEXT,
                         }
                     };
                     (@operand $name:ident : val) => {
                         match $name {
-                            AnyOperand::Register(reg) => Value::Register(reg),
-                            AnyOperand::Immediate(imm) => Value::Immediate(imm),
-                            AnyOperand::Port(_) => panic!("Invalid operand type, expected reg or imm, found port, at {}", cursor.node().pos()),
+                            (_, AnyOperand::Register(reg)) => Value::Register(reg),
+                            (node, AnyOperand::Immediate(imm)) => Value::Immediate((node, imm)),
+                            (node, AnyOperand::Port(_)) => err!(node; Value::Immediate((node, AnyImmediate::Number(0))), "Invalid operand type, expected register or immediate, found port"),
+                            (node, AnyOperand::Error) => Value::Immediate((node, AnyImmediate::Number(0))),
                         }
                     };
                     ($($opcode:ident$(($($name:ident : $type:ident),*))?,)*) => {
@@ -388,19 +385,19 @@ fn main() {
                                     $(
                                     match_opcodes!(@operands operands $($name:$type)*);
                                     )?
-                                    Instruction::$opcode$(($($name),*))?
+                                    Some(Instruction::$opcode$(($($name),*))?)
                                 }
                                 (stringify!($opcode), &[..]) => {
-                                    panic!(concat!("Invalid number of operands for opcode `", stringify!($opcode), "` at {}"), cursor.node().pos());
+                                    err!(cursor.node(); None, "Invalid number of operands for opcode `{opcode}`")
                                 }
                             )*
                             (opcode, _) => {
-                                panic!("Unknown opcode `{opcode}` at {}", cursor.node().pos());
+                                err!(cursor.node(); None, "Unknown opcode `{opcode}`")
                             }
                         }
                     };
                 }
-                lines.push(instructions!(match_opcodes));
+                instructions!(match_opcodes).map(|inst| lines.push(inst));
             }
             _ => (),
         }
@@ -414,8 +411,8 @@ fn main() {
         let mut offset = 0;
 
         for i in 0..lines.len() {
-            offset += lines[i].len();
             line_offsets.push(offset);
+            offset += lines[i].len();
         }
 
         (line_offsets, offset)
@@ -424,35 +421,82 @@ fn main() {
     let instructions = lines
         .into_iter()
         .map(|inst| {
-            inst.map(|imm| match imm {
+            inst.map(|(node, imm)| match imm {
                 AnyImmediate::Macro("@BITS") => u16::BITS as u16,
                 AnyImmediate::Macro("@MINHEAP") => minheap,
                 AnyImmediate::Macro("@MINSTACK") => minstack,
                 AnyImmediate::Macro("@MINREG") => minreg,
+                AnyImmediate::Macro("@HEAP") => minheap + minstack,
                 AnyImmediate::Macro("@MAX") => u16::MAX,
                 AnyImmediate::Macro("@SMAX") => i16::MAX as u16,
                 AnyImmediate::Macro("@MSB") => i16::MIN as u16,
                 AnyImmediate::Macro("@SMSB") => (i16::MIN as u16) >> 1,
                 AnyImmediate::Macro("@UHALF") => (u8::MAX as u16) << u8::BITS,
                 AnyImmediate::Macro("@LHALF") => u8::MAX as u16,
-                AnyImmediate::Macro(other) => panic!("Unknown macro {other}"),
+                AnyImmediate::Macro(other) => err!(node; 0, "Unknown macro {other}"),
                 AnyImmediate::Number(num) => num,
-                AnyImmediate::Char(ch) => (ch as u32).try_into().unwrap_or_else(|err| {
-                    panic!("Invalid character literal '{ch}'; does not fit in u16: {err}")
-                }),
+                AnyImmediate::Char(ch) => (ch as u32).try_into().unwrap_or_else(|err| err!(node; 0, "Invalid character literal '{ch}'; does not fit in u16: {err}")),
                 AnyImmediate::Line(idx) => {
-                    if idx >= line_offsets.len() {
-                        panic!("Relative line reference resolved to out of bounds line `{idx}`");
+                    if idx < line_offsets.len() {
+                        line_offsets[idx] as u16
+                    } else {
+                        err!(node; 0, "Relative line reference resolved to out of bounds line `{idx}`")
                     }
-                    line_offsets[idx] as u16
                 }
                 AnyImmediate::Label(label) => {
-                    *labels.get(label).unwrap_or_else(|| panic!("Unknown label `{label}`")) as u16
+                    labels
+                        .get(label)
+                        .map(|&idx| line_offsets[idx] as u16)
+                        .unwrap_or_else(|| err!(node; 0, "Undefined label `{label}`"))
                 }
                 AnyImmediate::Memory(heap) => total_size as u16 + heap,
             })
         })
         .collect::<Vec<_>>();
+
+    if !errors.is_empty() {
+        let max_line_no_width = source.lines().count().to_string().len();
+        eprintln!();
+        for SourceError { range, message } in errors {
+            if let Some(tree_sitter::Range {
+                start_point,
+                end_point,
+                ..
+            }) = range
+            {
+                if start_point.row == end_point.row {
+                    let row = start_point.row + 1;
+                    let line = source
+                        .lines()
+                        .nth(start_point.row)
+                        .expect("Error printing errors");
+                    let start = start_point.column;
+                    let end = end_point.column;
+                    let err_pointer: String = iter::repeat(' ')
+                        .take(start)
+                        .chain(iter::repeat('^'))
+                        .take(end)
+                        .collect();
+                    const SPC: char = ' ';
+                    eprintln!("{row:>max_line_no_width$} | {line}");
+                    eprintln!("{SPC:>max_line_no_width$}   {err_pointer}");
+                } else {
+                    let lines = source
+                        .lines()
+                        .enumerate()
+                        .skip(start_point.row)
+                        .take(end_point.row - start_point.row);
+                    for (row, line) in lines {
+                        let row = row + 1;
+                        eprintln!("{row:>max_line_no_width$} | {line}");
+                    }
+                }
+            }
+            eprintln!("{message}");
+            eprintln!();
+        }
+        std::process::exit(1);
+    }
 
     let mut output = fs::File::create(args.output).expect("Failed to open output file");
     output
@@ -462,7 +506,7 @@ fn main() {
         .write_u16::<BigEndian>(minstack)
         .expect("Failed to write to output file");
     for inst in instructions {
-        for &word in inst.encode().as_ref() {
+        for word in inst.encode() {
             output
                 .write_u16::<BigEndian>(word)
                 .expect("Failed to write to output file");
@@ -472,7 +516,7 @@ fn main() {
 
 #[derive(Clone, Copy)]
 #[repr(u16)]
-enum Register {
+pub enum Register {
     R0,
     R1,
     R2,
@@ -538,15 +582,15 @@ enum AnyImmediate<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum Value<Imm> {
+pub enum Value<Imm> {
     Register(Register),
     Immediate(Imm),
 }
 
 impl<Imm> Value<Imm> {
-    fn map<T, F>(self, f: F) -> Value<T>
+    fn map<T, F>(self, f: &mut F) -> Value<T>
     where
-        F: FnOnce(Imm) -> T,
+        F: FnMut(Imm) -> T,
     {
         match self {
             Value::Register(r) => Value::Register(r),
@@ -567,7 +611,7 @@ impl<Imm> Value<Imm> {
 
 #[derive(Clone, Copy)]
 #[repr(u16)]
-enum Port {
+pub enum Port {
     // General
     CPUBUS = 0,
     TEXT = 1,
@@ -697,581 +741,6 @@ impl TryFrom<&str> for Port {
             "%UD15" => Ok(Port::UD15),
             "%UD16" => Ok(Port::UD16),
             _ => Err(format!("Unknown port {value}")),
-        }
-    }
-}
-
-macro_rules! inst_decl {
-    (@type $imm:ident val) => {
-        Value<$imm>
-    };
-    (@type $imm:ident imm) => {
-        $imm
-    };
-    (@type $imm:ident reg) => {
-        Register
-    };
-    (@type $imm:ident port) => {
-        Port
-    };
-    ($name:ident<$imm:ident>; $($opcode:ident $(($($_:ident : $type:ident),*))?,)*) => {
-        enum $name<$imm> {
-            DW(Vec<$imm>),
-            $($opcode$(($(inst_decl!(@type $imm $type)),*))?,)*
-        }
-    }
-}
-instructions!(inst_decl!(Instruction<Imm>));
-
-impl<Imm> Instruction<Imm> {
-    pub fn map<T, F>(self, f: F) -> Instruction<T>
-    where
-        F: Fn(Imm) -> T,
-    {
-        macro_rules! map {
-            (@map $name:ident : reg) => {
-                $name
-            };
-            (@map $name:ident : imm) => {
-                f($name)
-            };
-            (@map $name:ident : val) => {
-                $name.map(&f)
-            };
-            (@map $name:ident : port) => {
-                $name
-            };
-            ($($opcode:ident $(($($name:ident : $type:ident),*))?,)*) => {
-                match self {
-                    Instruction::DW(vals) => Instruction::DW(vals.into_iter().map(f).collect()),
-                    $(
-                        Instruction::$opcode$(($($name),*))? => Instruction::$opcode$(($(map!(@map $name : $type)),*))?,
-                    )*
-                }
-            }
-        }
-        instructions!(map)
-    }
-
-    pub fn map_ref<T, F>(&self, f: F) -> Instruction<T>
-    where
-        F: Fn(&Imm) -> T,
-    {
-        macro_rules! map {
-            (@map $name:ident : reg) => {
-                *$name
-            };
-            (@map $name:ident : imm) => {
-                f($name)
-            };
-            (@map $name:ident : val) => {
-                $name.map_ref(&f)
-            };
-            (@map $name:ident : port) => {
-                *$name
-            };
-            ($($opcode:ident $(($($name:ident : $type:ident),*))?,)*) => {
-                match self {
-                    Instruction::DW(vals) => Instruction::DW(vals.iter().map(f).collect()),
-                    $(
-                        Instruction::$opcode$(($($name),*))? => Instruction::$opcode$(($(map!(@map $name : $type)),*))?,
-                    )*
-                }
-            }
-        }
-        instructions!(map)
-    }
-
-    pub fn len(&self) -> usize {
-        self.map_ref(|_| 0).encode().len()
-    }
-}
-
-impl Instruction<u16> {
-    pub fn encode<'a>(&'a self) -> Cow<'a, [u16]> {
-        fn pair(a: Register, b: Register) -> u16 {
-            (a as u16) << 8 | (b as u16)
-        }
-
-        fn pack2<A: Into<u16>, B: Into<u16>>(opcode: u16, a: A, b: B) -> u16 {
-            opcode << 8 | a.into() << 4 | b.into()
-        }
-
-        fn pack1<T: Into<u16>>(opcode: u16, lower: T) -> u16 {
-            opcode << 4 | lower.into()
-        }
-
-        macro_rules! reg {
-            ($name:ident) => {
-                Value::Register($name)
-            };
-            ($name:ident:!) => {
-                $name@(
-                    | Register::R0
-                    | Register::R1
-                    | Register::R2
-                    | Register::R3
-                    | Register::R4
-                    | Register::R5
-                    | Register::R6
-                    | Register::R7
-                    | Register::R8
-                    | Register::R9
-                    | Register::R10
-                    | Register::R11
-                    | Register::R12
-                    | Register::R13
-                    | Register::R14
-                    | Register::SP
-                )
-            };
-        }
-
-        macro_rules! imm {
-            ($name:ident) => {
-                Value::Immediate($name)
-            };
-            ($name:ident:!) => {
-                $name@0u16..=u16::MAX
-            };
-        }
-
-        macro_rules! port {
-            ($name:ident) => {
-                $name@(
-                    | Port::CPUBUS
-                    | Port::TEXT
-                    | Port::NUMB
-                    | Port::SUPPORTED
-                    | Port::SPECIAL
-                    | Port::PROFILE
-                    | Port::X
-                    | Port::Y
-                    | Port::COLOR
-                    | Port::BUFFER
-                    | Port::GSPECIAL
-                    | Port::ASCII8
-                    | Port::CHAR5
-                    | Port::CHAR6
-                    | Port::ASCII7
-                    | Port::UTF8
-                    | Port::TSPECIAL
-                    | Port::INT
-                    | Port::UINT
-                    | Port::BIN
-                    | Port::HEX
-                    | Port::FLOAT
-                    | Port::FIXED
-                    | Port::NSPECIAL
-                    | Port::ADDR
-                    | Port::BUS
-                    | Port::PAGE
-                    | Port::SSPECIAL
-                    | Port::RNG
-                    | Port::NOTE
-                    | Port::INSTR
-                    | Port::NLEG
-                    | Port::WAIT
-                    | Port::NADDR
-                    | Port::DATA
-                    | Port::MSPECIAL
-                    | Port::UD1
-                    | Port::UD2
-                    | Port::UD3
-                    | Port::UD4
-                    | Port::UD5
-                    | Port::UD6
-                    | Port::UD7
-                    | Port::UD8
-                    | Port::UD9
-                    | Port::UD10
-                    | Port::UD11
-                    | Port::UD12
-                    | Port::UD13
-                    | Port::UD14
-                    | Port::UD15
-                    | Port::UD16
-                )
-            };
-        }
-
-        macro_rules! encode {
-            ($($opcode:ident$(($($name:ident : $type:ident$(:$m:tt)?),*))? => [$($e:expr),*],)*) => {
-                match self {
-                    Self::DW(vals) => vals.into(),
-                    Self::NOP => [0b0000_0000].as_ref().into(),
-                    Self::HLT => [0b0000_0001].as_ref().into(),
-                    Self::RET => [0b0000_0010].as_ref().into(),
-                    $(Self::$opcode$(($($type!($name$(:$m)?)),*))? => vec![$($e),*].into(),)*
-                }
-            };
-        }
-
-        // :! suffix after type indicates that the other type is not allowed for that instruction
-        // so: CPY(dest:reg) because there is also CPY(dest:imm)
-        // but ADD(dest:reg:!) because there is no ADD(dest:imm)
-        encode! {
-            PSH(src:imm) => [0b_0000_0000_0000_0011, *src],
-            STR(dest:imm, src:imm) => [0b_0000_0000_0000_0100, *dest, *src],
-            CPY(dest:imm, src:imm) => [0b_0000_0000_0000_0101, *dest, *src],
-
-            CAL(dest:imm) => [0b_0000_0000_0000_0110, *dest],
-            JMP(dest:imm) => [0b_0000_0000_0000_0111, *dest],
-
-            BRG(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1000, *dest, *src1, *src2],
-            BGE(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1001, *dest, *src1, *src2],
-            BRL(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1010, *dest, *src1, *src2],
-            BLE(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1011, *dest, *src1, *src2],
-
-            SBRG(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1100, *dest, *src1, *src2],
-            SBGE(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1101, *dest, *src1, *src2],
-            SBRL(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1110, *dest, *src1, *src2],
-            SBLE(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0000_1111, *dest, *src1, *src2],
-
-            BRE(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0001_0000, *dest, *src1, *src2],
-            BNE(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0001_0001, *dest, *src1, *src2],
-            BRC(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0001_0010, *dest, *src1, *src2],
-            BNC(dest:imm, src1:imm, src2:imm) => [0b_0000_0000_0001_0011, *dest, *src1, *src2],
-
-            BRZ(dest:imm, src:imm) => [0b_0000_0000_0001_0100, *dest, *src],
-            BNZ(dest:imm, src:imm) => [0b_0000_0000_0001_0101, *dest, *src],
-
-            BRP(dest:imm, src:imm) => [0b_0000_0000_0001_0110, *dest, *src],
-            BRN(dest:imm, src:imm) => [0b_0000_0000_0001_0111, *dest, *src],
-            BOD(dest:imm, src:imm) => [0b_0000_0000_0001_1000, *dest, *src],
-            BEV(dest:imm, src:imm) => [0b_0000_0000_0001_1001, *dest, *src],
-
-            LSTR(dest:imm, src1:imm, src2:imm) => [0b_0000_0001_1010, *dest, *src1, *src2],
-
-            BRG(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0001_0000, *dest), pair(*src1, *src2)],
-            BRG(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0001_0001, *dest), *src1, *src2],
-            BRG(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0001_0010, *src1), *dest, *src2],
-            BRG(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0001_0011, *src2), *dest, *src1],
-
-            BGE(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0001_0100, *dest), pair(*src1, *src2)],
-            BGE(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0001_0101, *dest), *src1, *src2],
-            BGE(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0001_0110, *src1), *dest, *src2],
-            BGE(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0001_0111, *src2), *dest, *src1],
-
-            BRL(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0001_1000, *dest), pair(*src1, *src2)],
-            BRL(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0001_1001, *dest), *src1, *src2],
-            BRL(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0001_1010, *src1), *dest, *src2],
-            BRL(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0001_1011, *src2), *dest, *src1],
-
-            BLE(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0001_1100, *dest), pair(*src1, *src2)],
-            BLE(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0001_1101, *dest), *src1, *src2],
-            BLE(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0001_1110, *src1), *dest, *src2],
-            BLE(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0001_1111, *src2), *dest, *src1],
-
-            SBRG(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0010_0000, *dest), pair(*src1, *src2)],
-            SBRG(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0010_0001, *dest), *src1, *src2],
-            SBRG(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0010_0010, *src1), *dest, *src2],
-            SBRG(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0010_0011, *src2), *dest, *src1],
-
-            SBGE(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0010_0100, *dest), pair(*src1, *src2)],
-            SBGE(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0010_0101, *dest), *src1, *src2],
-            SBGE(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0010_0110, *src1), *dest, *src2],
-            SBGE(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0010_0111, *src2), *dest, *src1],
-
-            SBRL(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0010_1000, *dest), pair(*src1, *src2)],
-            SBRL(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0010_1001, *dest), *src1, *src2],
-            SBRL(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0010_1010, *src1), *dest, *src2],
-            SBRL(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0010_1011, *src2), *dest, *src1],
-
-            SBLE(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0010_1100, *dest), pair(*src1, *src2)],
-            SBLE(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0010_1101, *dest), *src1, *src2],
-            SBLE(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0010_1110, *src1), *dest, *src2],
-            SBLE(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0010_1111, *src2), *dest, *src1],
-
-            BRE(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_0011_0000, *dest), pair(*src1, *src2)],
-            BRE(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_0011_0001, *dest), *src1, *src2],
-            BRE(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_0011_0010, *src1), *dest, *src2],
-            BRE(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_0011_0011, *src2), *dest, *src1],
-
-            BNE(dest:reg, src1:reg, src2:reg) => [pack1(0b_0011_0100, *dest), pair(*src1, *src2)],
-            BNE(dest:reg, src1:imm, src2:imm) => [pack1(0b_0011_0101, *dest), *src1, *src2],
-            BNE(dest:imm, src1:reg, src2:imm) => [pack1(0b_0011_0110, *src1), *dest, *src2],
-            BNE(dest:imm, src1:imm, src2:reg) => [pack1(0b_0011_0111, *src2), *dest, *src1],
-
-            BRC(dest:reg, src1:reg, src2:reg) => [pack1(0b_0011_1000, *dest), pair(*src1, *src2)],
-            BRC(dest:reg, src1:imm, src2:imm) => [pack1(0b_0011_1001, *dest), *src1, *src2],
-            BRC(dest:imm, src1:reg, src2:imm) => [pack1(0b_0011_1010, *src1), *dest, *src2],
-            BRC(dest:imm, src1:imm, src2:reg) => [pack1(0b_0011_1011, *src2), *dest, *src1],
-
-            BNC(dest:reg, src1:reg, src2:reg) => [pack1(0b_0011_1100, *dest), pair(*src1, *src2)],
-            BNC(dest:reg, src1:imm, src2:imm) => [pack1(0b_0011_1101, *dest), *src1, *src2],
-            BNC(dest:imm, src1:reg, src2:imm) => [pack1(0b_0011_1110, *src1), *dest, *src2],
-            BNC(dest:imm, src1:imm, src2:reg) => [pack1(0b_0011_1111, *src2), *dest, *src1],
-
-            BRP(dest:reg, src:imm) => [pack1(0b_0011_0000, *dest), *src],
-            BRP(dest:imm, src:reg) => [pack1(0b_0011_0001, *src), *dest],
-            BRN(dest:reg, src:imm) => [pack1(0b_0011_0010, *dest), *src],
-            BRN(dest:imm, src:reg) => [pack1(0b_0011_0011, *src), *dest],
-
-            BRZ(dest:reg, src:imm) => [pack1(0b_0011_0100, *dest), *src],
-            BRZ(dest:imm, src:reg) => [pack1(0b_0011_0101, *src), *dest],
-            BNZ(dest:reg, src:imm) => [pack1(0b_0011_0110, *dest), *src],
-            BNZ(dest:imm, src:reg) => [pack1(0b_0011_0111, *src), *dest],
-
-            ADD(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0100_1000, *dest), pair(*src1, *src2)],
-            ADD(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0100_1001, *dest), *src1, *src2],
-            SUB(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0100_1010, *dest), pair(*src1, *src2)],
-            SUB(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0100_1011, *dest), *src1, *src2],
-
-            INC(dest:reg:!, src:imm) => [pack1(0b_0000_0100_1100, *dest), *src],
-            DEC(dest:reg:!, src:imm) => [pack1(0b_0000_0100_1101, *dest), *src],
-            NEG(dest:reg:!, src:imm) => [pack1(0b_0000_0100_1110, *dest), *src],
-            NOT(dest:reg:!, src:imm) => [pack1(0b_0000_0100_1111, *dest), *src],
-
-            CPY(dest:reg, src:imm) => [pack1(0b_0000_0101_0000, *dest), *src],
-            CPY(dest:imm, src:reg) => [pack1(0b_0000_0101_0001, *src), *dest],
-
-            MLT(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_0010, *dest), pair(*src1, *src2)],
-            MLT(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_0011, *dest), *src1, *src2],
-
-            DIV(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_0100, *dest), pair(*src1, *src2)],
-            DIV(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_0101, *dest), *src1, *src2],
-            SDIV(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_0110, *dest), pair(*src1, *src2)],
-            SDIV(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_0111, *dest), *src1, *src2],
-
-            MOD(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_1000, *dest), pair(*src1, *src2)],
-            MOD(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_1001, *dest), *src1, *src2],
-            SMOD(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_1010, *dest), pair(*src1, *src2)],
-            SMOD(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_1011, *dest), *src1, *src2],
-
-            AND(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_1100, *dest), pair(*src1, *src2)],
-            AND(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_1101, *dest), *src1, *src2],
-            NAND(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0101_1110, *dest), pair(*src1, *src2)],
-            NAND(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0101_1111, *dest), *src1, *src2],
-
-            OR(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0110_0000, *dest), pair(*src1, *src2)],
-            OR(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0110_0001, *dest), *src1, *src2],
-            NOR(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0110_0010, *dest), pair(*src1, *src2)],
-            NOR(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0110_0011, *dest), *src1, *src2],
-
-            XOR(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0110_0100, *dest), pair(*src1, *src2)],
-            XOR(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0110_0101, *dest), *src1, *src2],
-            XNOR(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0110_0110, *dest), pair(*src1, *src2)],
-            XNOR(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0110_0111, *dest), *src1, *src2],
-
-            LLOD(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0110_1000, *dest), pair(*src1, *src2)],
-            LLOD(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0110_1001, *dest), *src1, *src2],
-
-            IMM(dest:reg:!, src:imm:!) => [pack1(0b_0000_0110_1010, *dest), *src],
-
-            RSH(dest:reg:!, src:imm) => [pack1(0b_0000_0110_1011, *dest), *src],
-            LSH(dest:reg:!, src:imm) => [pack1(0b_0000_0110_1100, *dest), *src],
-            SRS(dest:reg:!, src:imm) => [pack1(0b_0000_0110_1101, *dest), *src],
-
-            BSR(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0110_1110, *dest), pair(*src1, *src2)],
-            BSR(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0110_1111, *dest), *src1, *src2],
-            BSL(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_0000, *dest), pair(*src1, *src2)],
-            BSL(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_0001, *dest), *src1, *src2],
-            BSS(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_0010, *dest), pair(*src1, *src2)],
-            BSS(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_0011, *dest), *src1, *src2],
-
-            SETG(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_0100, *dest), pair(*src1, *src2)],
-            SETG(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_0101, *dest), *src1, *src2],
-            SETGE(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_0110, *dest), pair(*src1, *src2)],
-            SETGE(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_0111, *dest), *src1, *src2],
-
-            SETL(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_1000, *dest), pair(*src1, *src2)],
-            SETL(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_1001, *dest), *src1, *src2],
-            SETLE(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_1010, *dest), pair(*src1, *src2)],
-            SETLE(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_1011, *dest), *src1, *src2],
-
-            SETE(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_1100, *dest), pair(*src1, *src2)],
-            SETE(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_1101, *dest), *src1, *src2],
-            SETNE(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_0111_1110, *dest), pair(*src1, *src2)],
-            SETNE(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_0111_1111, *dest), *src1, *src2],
-
-            SETC(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_1000_0000, *dest), pair(*src1, *src2)],
-            SETC(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_1000_0001, *dest), *src1, *src2],
-            SETNC(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_1000_0010, *dest), pair(*src1, *src2)],
-            SETNC(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_1000_0011, *dest), *src1, *src2],
-
-            SSETG(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_1000_0100, *dest), pair(*src1, *src2)],
-            SSETG(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_1000_0101, *dest), *src1, *src2],
-            SSETGE(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_1000_0110, *dest), pair(*src1, *src2)],
-            SSETGE(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_1000_0111, *dest), *src1, *src2],
-
-            SSETL(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_1000_1000, *dest), pair(*src1, *src2)],
-            SSETL(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_1000_1001, *dest), *src1, *src2],
-            SSETLE(dest:reg:!, src1:reg, src2:reg) => [pack1(0b_0000_1000_1010, *dest), pair(*src1, *src2)],
-            SSETLE(dest:reg:!, src1:imm, src2:imm) => [pack1(0b_0000_1000_1011, *dest), *src1, *src2],
-
-            LSTR(dest:reg, src1:reg, src2:reg) => [pack1(0b_0000_1000_1100, *dest), pair(*src1, *src2)],
-            LSTR(dest:reg, src1:imm, src2:imm) => [pack1(0b_0000_1000_1101, *dest), *src1, *src2],
-            LSTR(dest:imm, src1:reg, src2:imm) => [pack1(0b_0000_1000_1110, *src1), *dest, *src2],
-            LSTR(dest:imm, src1:imm, src2:reg) => [pack1(0b_0000_1000_1111, *src2), *dest, *src1],
-
-            PSH(src:reg) => [pack1(0b_0000_1001_0000, *src)],
-            POP(dest:reg:!) => [pack1(0b_0000_1001_0001, *dest)],
-
-            CAL(dest:reg) => [pack1(0b_0000_1001_0010, *dest)],
-            JMP(dest:reg) => [pack1(0b_0000_1001_0011, *dest)],
-
-            LOD(dest:reg:!, src:imm) => [pack1(0b_0000_1001_0100, *dest), *src],
-            STR(dest:reg, src:imm) => [pack1(0b_0000_1001_0101, *dest), *src],
-            STR(dest:imm, src:reg) => [pack1(0b_0000_1001_0110, *src), *dest],
-
-            BOD(dest:reg, src:imm) => [pack1(0b_0000_1001_1000, *dest), *src],
-            BOD(dest:imm, src:reg) => [pack1(0b_0000_1001_1001, *src), *dest],
-            BEV(dest:reg, src:imm) => [pack1(0b_0000_1001_1010, *dest), *src],
-            BEV(dest:imm, src:reg) => [pack1(0b_0000_1001_1011, *src), *dest],
-
-            OUT(dest:port, src:imm) => [pack1(0b_0111_1111_11 << 2 | dest.upper(), dest.lower()), *src],
-            IN(dest:reg:!, src:port) => [pack2(0b_1000_00 << 2 | src.upper(), *dest, src.lower())],
-            OUT(dest:port, src:reg) => [pack2(0b_1000_01 << 2 | dest.upper(), dest.lower(), *src)],
-
-            LOD(dest:reg:!, src:reg) => [pack2(0b_0000_1000_1000, *dest, *src)],
-            STR(dest:reg, src:reg) => [pack2(0b_0000_1000_1001, *dest, *src)],
-
-            LLOD(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1000_1010, *dest, *src1), *src2],
-            LLOD(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1000_1011, *dest, *src2), *src1],
-
-            RSH(dest:reg:!, src:reg) => [pack2(0b_1000_1100, *dest, *src)],
-            LSH(dest:reg:!, src:reg) => [pack2(0b_1000_1101, *dest, *src)],
-            SRS(dest:reg:!, src:reg) => [pack2(0b_1000_1110, *dest, *src)],
-
-            LSTR(dest:reg, src1:reg, src2:imm) => [pack2(0b_1000_1111, *dest, *src1), *src2],
-            LSTR(dest:reg, src1:imm, src2:reg) => [pack2(0b_1001_0000, *dest, *src2), *src1],
-            LSTR(dest:imm, src1:reg, src2:reg) => [pack2(0b_1001_0001, *src1, *src2), *dest],
-
-            ADD(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1001_0010, *dest, *src1), *src2],
-            ADD(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1001_0011, *dest, *src2), *src1],
-            SUB(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1001_0100, *dest, *src1), *src2],
-            SUB(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1001_0101, *dest, *src2), *src1],
-
-            INC(dest:reg:!, src:reg) => [pack2(0b_1001_0110, *dest, *src)],
-            DEC(dest:reg:!, src:reg) => [pack2(0b_1001_0111, *dest, *src)],
-            NEG(dest:reg:!, src:reg) => [pack2(0b_1001_1000, *dest, *src)],
-            NOT(dest:reg:!, src:reg) => [pack2(0b_1001_1001, *dest, *src)],
-
-            MLT(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1001_1010, *dest, *src1), *src2],
-            MLT(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1001_1011, *dest, *src2), *src1],
-
-            DIV(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1001_1100, *dest, *src1), *src2],
-            DIV(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1001_1101, *dest, *src2), *src1],
-            SDIV(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1001_1110, *dest, *src1), *src2],
-            SDIV(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1001_1111, *dest, *src2), *src1],
-
-            MOD(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_0000, *dest, *src1), *src2],
-            MOD(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_0001, *dest, *src2), *src1],
-            SMOD(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_0010, *dest, *src1), *src2],
-            SMOD(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_0011, *dest, *src2), *src1],
-
-            AND(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_0100, *dest, *src1), *src2],
-            AND(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_0101, *dest, *src2), *src1],
-            NAND(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_0110, *dest, *src1), *src2],
-            NAND(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_0111, *dest, *src2), *src1],
-
-            OR(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_1000, *dest, *src1), *src2],
-            OR(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_1001, *dest, *src2), *src1],
-            NOR(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_1010, *dest, *src1), *src2],
-            NOR(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_1011, *dest, *src2), *src1],
-
-            XOR(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_1100, *dest, *src1), *src2],
-            XOR(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_1101, *dest, *src2), *src1],
-            XNOR(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1010_1110, *dest, *src1), *src2],
-            XNOR(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1010_1111, *dest, *src2), *src1],
-
-            BSL(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1011_0000, *dest, *src1), *src2],
-            BSL(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1011_0001, *dest, *src2), *src1],
-            BSR(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1011_0010, *dest, *src1), *src2],
-            BSR(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1011_0011, *dest, *src2), *src1],
-            BSS(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1011_0100, *dest, *src1), *src2],
-            BSS(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1011_0101, *dest, *src2), *src1],
-
-            BRC(dest:reg, src1:reg, src2:imm) => [pack2(0b_1011_0110, *dest, *src1), *src2],
-            BRC(dest:reg, src1:imm, src2:reg) => [pack2(0b_1011_0111, *dest, *src2), *src1],
-            BRC(dest:imm, src1:reg, src2:reg) => [pack2(0b_1011_1000, *src1, *src2), *dest],
-
-            BNC(dest:reg, src1:reg, src2:imm) => [pack2(0b_1011_1001, *dest, *src1), *src2],
-            BNC(dest:reg, src1:imm, src2:reg) => [pack2(0b_1011_1010, *dest, *src2), *src1],
-            BNC(dest:imm, src1:reg, src2:reg) => [pack2(0b_1011_1011, *src1, *src2), *dest],
-
-            BRE(dest:reg, src1:reg, src2:imm) => [pack2(0b_1011_1100, *dest, *src1), *src2],
-            BRE(dest:reg, src1:imm, src2:reg) => [pack2(0b_1011_1101, *dest, *src2), *src1],
-            BRE(dest:imm, src1:reg, src2:reg) => [pack2(0b_1011_1110, *src1, *src2), *dest],
-
-            BNE(dest:reg, src1:reg, src2:imm) => [pack2(0b_1011_1111, *dest, *src1), *src2],
-            BNE(dest:reg, src1:imm, src2:reg) => [pack2(0b_1100_0000, *dest, *src2), *src1],
-            BNE(dest:imm, src1:reg, src2:reg) => [pack2(0b_1100_0001, *src1, *src2), *dest],
-
-            BOD(dest:reg, src:reg) => [pack2(0b_1100_0010, *dest, *src)],
-            BEV(dest:reg, src:reg) => [pack2(0b_1100_0011, *dest, *src)],
-
-            BRZ(dest:reg, src:reg) => [pack2(0b_1100_0100, *dest, *src)],
-            BNZ(dest:reg, src:reg) => [pack2(0b_1100_0101, *dest, *src)],
-
-            BRP(dest:reg, src:reg) => [pack2(0b_1100_0110, *dest, *src)],
-            BRN(dest:reg, src:reg) => [pack2(0b_1100_0111, *dest, *src)],
-
-            SBRG(dest:reg, src1:reg, src2:imm) => [pack2(0b_1100_1000, *dest, *src1), *src2],
-            SBRG(dest:reg, src1:imm, src2:reg) => [pack2(0b_1100_1001, *dest, *src2), *src1],
-            SBRG(dest:imm, src1:reg, src2:reg) => [pack2(0b_1100_1010, *src1, *src2), *dest],
-
-            SBGE(dest:reg, src1:reg, src2:imm) => [pack2(0b_1100_1011, *dest, *src1), *src2],
-            SBGE(dest:reg, src1:imm, src2:reg) => [pack2(0b_1100_1100, *dest, *src2), *src1],
-            SBGE(dest:imm, src1:reg, src2:reg) => [pack2(0b_1100_1101, *src1, *src2), *dest],
-
-            SBRL(dest:reg, src1:reg, src2:imm) => [pack2(0b_1100_1110, *dest, *src1), *src2],
-            SBRL(dest:reg, src1:imm, src2:reg) => [pack2(0b_1100_1111, *dest, *src2), *src1],
-            SBRL(dest:imm, src1:reg, src2:reg) => [pack2(0b_1101_0000, *src1, *src2), *dest],
-
-            SBLE(dest:reg, src1:reg, src2:imm) => [pack2(0b_1101_0001, *dest, *src1), *src2],
-            SBLE(dest:reg, src1:imm, src2:reg) => [pack2(0b_1101_0010, *dest, *src2), *src1],
-            SBLE(dest:imm, src1:reg, src2:reg) => [pack2(0b_1101_0011, *src1, *src2), *dest],
-
-            SETE(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1101_0100, *dest, *src1), *src2],
-            SETE(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1101_0101, *dest, *src2), *src1],
-            SETNE(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1101_0110, *dest, *src1), *src2],
-            SETNE(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1101_0111, *dest, *src2), *src1],
-
-            SETC(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1101_1000, *dest, *src1), *src2],
-            SETC(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1101_1001, *dest, *src2), *src1],
-            SETNC(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1101_1010, *dest, *src1), *src2],
-            SETNC(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1101_1011, *dest, *src2), *src1],
-
-            SETG(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1101_1100, *dest, *src1), *src2],
-            SETG(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1101_1101, *dest, *src2), *src1],
-            SETGE(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1101_1110, *dest, *src1), *src2],
-            SETGE(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1101_1111, *dest, *src2), *src1],
-
-            SETL(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1110_0000, *dest, *src1), *src2],
-            SETL(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1110_0001, *dest, *src2), *src1],
-            SETLE(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1110_0010, *dest, *src1), *src2],
-            SETLE(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1110_0011, *dest, *src2), *src1],
-
-            SSETG(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1110_0100, *dest, *src1), *src2],
-            SSETG(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1110_0101, *dest, *src2), *src1],
-            SSETGE(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1110_0110, *dest, *src1), *src2],
-            SSETGE(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1110_0111, *dest, *src2), *src1],
-
-            SSETL(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1110_1000, *dest, *src1), *src2],
-            SSETL(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1110_1001, *dest, *src2), *src1],
-            SSETLE(dest:reg:!, src1:reg, src2:imm) => [pack2(0b_1110_1010, *dest, *src1), *src2],
-            SSETLE(dest:reg:!, src1:imm, src2:reg) => [pack2(0b_1110_1011, *dest, *src2), *src1],
-
-            MOV(dest:reg:!, src:reg:!) => [pack2(0b_1110_1100, *dest, *src)],
-            CPY(dest:reg, src:reg) => [pack2(0b_1110_1101, *dest, *src)],
-
-            BRG(dest:reg, src1:reg, src2:imm) => [pack2(0b_1111_0000, *dest, *src1), *src2],
-            BRG(dest:reg, src1:imm, src2:reg) => [pack2(0b_1111_0001, *dest, *src2), *src1],
-            BRG(dest:imm, src1:reg, src2:reg) => [pack2(0b_1111_0010, *src1, *src2), *dest],
-
-            BGE(dest:reg, src1:reg, src2:imm) => [pack2(0b_1111_0011, *dest, *src1), *src2],
-            BGE(dest:reg, src1:imm, src2:reg) => [pack2(0b_1111_0100, *dest, *src2), *src1],
-            BGE(dest:imm, src1:reg, src2:reg) => [pack2(0b_1111_0101, *src1, *src2), *dest],
-
-            BRL(dest:reg, src1:reg, src2:imm) => [pack2(0b_1111_0110, *dest, *src1), *src2],
-            BRL(dest:reg, src1:imm, src2:reg) => [pack2(0b_1111_0111, *dest, *src2), *src1],
-            BRL(dest:imm, src1:reg, src2:reg) => [pack2(0b_1111_1000, *src1, *src2), *dest],
-
-            BLE(dest:reg, src1:reg, src2:imm) => [pack2(0b_1111_1001, *dest, *src1), *src2],
-            BLE(dest:reg, src1:imm, src2:reg) => [pack2(0b_1111_1010, *dest, *src2), *src1],
-            BLE(dest:imm, src1:reg, src2:reg) => [pack2(0b_1111_1011, *src1, *src2), *dest],
         }
     }
 }
