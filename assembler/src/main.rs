@@ -1,62 +1,30 @@
 mod instructions;
 use instructions::*;
 
-use std::{collections::HashMap, fmt, fs, iter};
+use std::{collections::HashMap, fs, iter, path::PathBuf};
 
 use byteorder::{BigEndian, WriteBytesExt};
 use clap::Parser;
-use tree_sitter::{Node, Point};
+use tree_sitter::Node;
 
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(short, long = "input-file")]
-    input: String,
+    input: PathBuf,
 
     #[clap(short, long = "output-file")]
-    output: String,
-}
+    output: PathBuf,
 
-#[derive(Clone, Copy, Default)]
-pub struct Position {
-    pub row: usize,
-    pub column: usize,
-}
-
-impl From<Point> for Position {
-    fn from(p: Point) -> Self {
-        Self {
-            row: p.row + 1,
-            column: p.column + 1,
-        }
-    }
-}
-
-impl fmt::Display for Position {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.row == 0 && self.column == 0 {
-            write!(f, "[compiler synthesized]")
-        } else {
-            write!(f, "[{}:{}]", self.row, self.column)
-        }
-    }
+    #[clap(long)]
+    sourcemap: Option<PathBuf>,
 }
 
 pub trait NodeExt {
-    fn pos(&self) -> Position;
-    fn end_pos(&self) -> Position;
     fn text<'a>(&self, source: &'a str) -> &'a str;
     fn field(&self, name: &str) -> Self;
 }
 
 impl NodeExt for Node<'_> {
-    fn pos(&self) -> Position {
-        self.start_position().into()
-    }
-
-    fn end_pos(&self) -> Position {
-        self.end_position().into()
-    }
-
     fn text<'a>(&self, source: &'a str) -> &'a str {
         &source[self.byte_range()]
     }
@@ -64,9 +32,10 @@ impl NodeExt for Node<'_> {
     fn field(&self, name: &str) -> Self {
         self.child_by_field_name(name).unwrap_or_else(|| {
             unreachable!(
-                "Badly formatted syntax tree (`{}` node is missing field `{name}` at {})",
+                "Badly formatted syntax tree (`{}` node is missing field `{name}` at [{}:{}])",
                 self.kind().to_string(),
-                self.pos()
+                self.start_position().row + 1,
+                self.start_position().column + 1,
             )
         })
     }
@@ -447,8 +416,8 @@ fn main() {
 
     let instructions = lines
         .into_iter()
-        .map(|(_, inst)| {
-            inst.map(|(node, imm)| match imm {
+        .map(|(node, inst)| {
+            (node, inst.map(|(node, imm)| match imm {
                 AnyImmediate::Macro("@BITS") => u16::BITS as u16,
                 AnyImmediate::Macro("@MINHEAP") => minheap,
                 AnyImmediate::Macro("@MINSTACK") => minstack,
@@ -477,7 +446,7 @@ fn main() {
                         .unwrap_or_else(|| err!(node; 0, "Undefined label `{label}`"))
                 }
                 AnyImmediate::Memory(heap) => total_size as u16 + heap,
-            })
+            }))
         })
         .collect::<Vec<_>>();
 
@@ -532,8 +501,12 @@ fn main() {
     output
         .write_u16::<BigEndian>(minstack)
         .expect("Failed to write to output file");
+    let mut sourcemap = args
+        .sourcemap
+        .map(fs::File::create)
+        .map(|f| f.expect("Failed to open sourcemap file"));
     let mut size = 0;
-    for inst3 in instructions {
+    for (node, inst3) in instructions {
         for inst2 in inst3
             .lower(volatile_reg, size)
             .expect("Error processing instructions after all errors should have been caught.")
@@ -542,6 +515,9 @@ fn main() {
                 output
                     .write_u16::<BigEndian>(word)
                     .expect("Failed to write to output file");
+                if let Some(ref mut sourcemap) = sourcemap {
+                    sourcemap.write_u16::<BigEndian>(node.start_position().row as u16).expect("Failed to write to sourcemap file");
+                }
                 size += 1;
             }
         }

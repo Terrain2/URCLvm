@@ -94,7 +94,7 @@ There is one exception to the above rule, being that `001X XXXX` is reserved for
 
 Binary branches (2 sources) take an additional immediate value, which is the branch destination. If it's the immediate variant, the branch destination comes after the immediate operand. The opcodes `0010 XXXX` are reserved for binary. The upper bit of the 4 variable bits negates the condition, so it's really just 3 bits for the condition.
 
-To use a register as the destination for a binary branch type, you must negate the branch and jump to like 2 instructions ahead, and then use ``JMP reg`` to jump to the destination.
+To use a register as the destination for a binary branch type, you must negate the branch and jump to like 2 instructions ahead, and then use `JMP reg` to jump to the destination.
 
 |   Opcode    | Branch     |
 | :---------: | :--------- |
@@ -105,7 +105,6 @@ To use a register as the destination for a binary branch type, you must negate t
 | `0010 0100` | `BRE`      |
 | `0010 0101` | `BRC`      |
 | `0010 011X` | Unassigned |
-| `0010 01XX` | Unassigned |
 | `0010 1000` | `BLE`      |
 | `0010 1001` | `BGE`      |
 | `0010 1010` | `SBLE`     |
@@ -113,7 +112,6 @@ To use a register as the destination for a binary branch type, you must negate t
 | `0010 1100` | `BNE`      |
 | `0010 1101` | `BNC`      |
 | `0010 111X` | Unassigned |
-| `0010 11XX` | Unassigned |
 
 `0011 XXXX` is reserved for unary branches. These follow the normal operand format in terms of memory representation, but the branch destination is the _second_ operand (register or immediate), and the source always has to be the first (register). The same bit flips the condition for these too.
 
@@ -181,14 +179,13 @@ The rest of these instructions _do_ follow the normal operand format with either
 | `0110 0100` | `SETE`              |
 | `0110 0101` | `SETC`              |
 | `0110 011X` | Reserved for `SET*` |
-| `0110 1XXX` | Reserved for `SET*` |
-| `0111 0000` | `SETLE`             |
-| `0111 0001` | `SETGE`             |
-| `0111 0010` | `SSETLE`            |
-| `0111 0011` | `SSETGE`            |
-| `0111 0100` | `SETNE`             |
-| `0111 0101` | `SETNC`             |
-| `0111 011X` | Reserved for `SET*` |
-| `0111 1XXX` | Reserved for `SET*` |
+| `0110 1000` | `SETLE`             |
+| `0110 1001` | `SETGE`             |
+| `0110 1010` | `SSETLE`            |
+| `0110 1011` | `SSETGE`            |
+| `0110 1100` | `SETNE`             |
+| `0110 1101` | `SETNC`             |
+| `0110 111X` | Reserved for `SET*` |
 |             |                     |
-| `1XXX XXXX` | Unasssigned         |
+| `0111 XXXX` | Unassigned          |
+| `1XXX XXXX` | Unassigned          |

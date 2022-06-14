@@ -2,9 +2,10 @@ use super::*;
 
 use derive_more::Display;
 use derive_try_from_primitive::TryFromPrimitive;
+use terminal::Terminal;
 use std::{
-    cell::{RefCell},
-    io::{BufRead, Read, Seek, SeekFrom, Write},
+    cell::RefCell,
+    io::{Read, Seek, SeekFrom, Write},
     ops::{Index, IndexMut},
     rc::Rc,
 };
@@ -169,8 +170,8 @@ impl PortImpl for SupportedPort {
 
 impl Ports {
     pub fn standard<Pixel: image::Pixel>(
-        io: Option<(impl BufRead + 'static, impl Write + 'static)>,
-        storage: Option<impl Read + Write + Seek + 'static>,
+        io: Option<Terminal<impl Write + 'static>>,
+        storage: Option<(impl Read + Write + Seek + AdjustLength + 'static, u16)>,
         image: Option<(
             impl Image<Pixel> + 'static,
             impl Fn(u16) -> Pixel + 'static,
@@ -212,17 +213,18 @@ impl Ports {
             }
         }
 
-        if let Some(storage) = storage {
+        if let Some((storage, pages)) = storage {
             struct StorageState<S: Read + Write + Seek> {
                 storage: S,
                 page: u16,
                 addr: u16,
+                pages: u16,
             }
-            impl<S: Read + Write + Seek> StorageState<S> {
+            impl<S: Read + Write + Seek + AdjustLength> StorageState<S> {
                 fn seek(&mut self) {
                     self.storage
                         .seek(SeekFrom::Start(
-                            (((self.page as u64) << 16) | self.addr as u64) << 1,
+                            (((self.page as u64) << 16) | (self.addr as u64)) << 1,
                         ))
                         .expect("Error seeking in storage");
                 }
@@ -231,12 +233,22 @@ impl Ports {
                 storage,
                 page: 0,
                 addr: 0,
+                pages,
             }));
             port!(PAGE) = Some(Box::new({
                 AnonPort {
                     state: state.clone(),
                     read: |state| state.borrow().page,
-                    write: |state, word| state.borrow_mut().page = word.into(),
+                    write: |state, word| {
+                        let page: u16 = word.into();
+                        let pages = state.borrow().pages;
+                        if page >= pages {
+                            panic!(
+                                "%PAGE got {page}, which is out of range, storage only has {pages}"
+                            );
+                        }
+                        state.borrow_mut().page = page;
+                    },
                 }
             }));
 
@@ -266,6 +278,24 @@ impl Ports {
                             .storage
                             .write_u16::<BigEndian>(word.into())
                             .expect("Error writing to storage");
+                    },
+                }
+            }));
+
+            port!(SSPECIAL) = Some(Box::new({
+                AnonPort {
+                    state: state.clone(),
+                    read: |state| state.borrow().pages,
+                    write: |state, word| {
+                        let pages: u16 = word.into();
+                        if pages == 0 {
+                            panic!("%SSPECIAL received 0. You cannot delete storage.");
+                        }
+                        let mut state = state.borrow_mut();
+                        state.pages = pages;
+                        if state.page >= state.pages {
+                            state.page = state.pages - 1;
+                        }
                     },
                 }
             }));

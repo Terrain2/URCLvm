@@ -5,8 +5,8 @@ Param(
     [string[]]$params
 )
 
-cargo run --manifest-path ./assembler/Cargo.toml -- -i "$program" -o program.bin
+cargo run --manifest-path ./assembler/Cargo.toml -- -i "$program" -o program.bin --sourcemap program.map
 
 if ($LASTEXITCODE -eq 0) {
-    cargo run --manifest-path ./vm/Cargo.toml -- program.bin $params
+    cargo run --manifest-path ./vm/Cargo.toml -- program.bin --sourcemap program.map $params
 }

@@ -1,79 +1,89 @@
 use std::{
     cell::{RefCell, RefMut},
-    io::{BufRead, Write},
-    rc::Rc, iter,
+    io::Write,
+    iter,
+    rc::Rc,
 };
 
 use super::*;
 use half::f16;
 use radix_fmt::radix;
-use unicode_reader::CodePoints;
 
 // This is here so i can use associated types and pass IO: IoPorts without explicitly capturing R and W separately.
 trait IoPorts {
-    type R: BufRead;
     type W: Write;
     fn pending(&mut self) -> &mut Option<&'static str>;
-    fn input(&mut self) -> &mut Self::R;
-    fn output(&mut self) -> &mut Self::W;
+    fn terminal(&mut self) -> &mut Terminal<Self::W>;
+    fn char(&mut self) -> char;
+    fn read_line(&mut self) -> String;
 }
 
-struct ActualIoPorts<R: BufRead, W: Write> {
+struct ActualIoPorts<W: Write> {
     pending: Option<&'static str>,
-    input: R,
-    output: W,
+    terminal: Terminal<W>,
 }
 
-impl<R: BufRead, W: Write> IoPorts for ActualIoPorts<R, W> {
-    type R = R;
+impl<W: Write> IoPorts for ActualIoPorts<W> {
     type W = W;
     fn pending(&mut self) -> &mut Option<&'static str> {
         &mut self.pending
     }
-    fn input(&mut self) -> &mut Self::R {
-        &mut self.input
+    fn terminal(&mut self) -> &mut Terminal<Self::W> {
+        &mut self.terminal
     }
-    fn output(&mut self) -> &mut Self::W {
-        &mut self.output
+
+    fn char(&mut self) -> char {
+        self.terminal.act(terminal::Action::EnableRawMode).expect("Failed to enable raw mode");
+        let ch = loop {
+            if let terminal::Retrieved::Event(Some(terminal::Event::Key(key_event))) = self
+                .terminal
+                .get(terminal::Value::Event(None))
+                .expect("Error reading stdin")
+            {
+                match key_event.code {
+                    terminal::KeyCode::Char(c) => break c,
+                    terminal::KeyCode::Backspace => break '\x7f',
+                    terminal::KeyCode::Enter => break '\n',
+                    terminal::KeyCode::Null => break '\0',
+                    terminal::KeyCode::Tab => break '\t',
+                    _ => continue,
+                }
+            }
+        };
+        self.terminal.act(terminal::Action::DisableRawMode).expect("Failed to disable raw mode");
+        ch
     }
-}
 
-struct ShareReadBytes<IO: IoPorts> {
-    stdio: Rc<RefCell<IO>>,
-}
-
-impl<IO: IoPorts> Iterator for ShareReadBytes<IO> {
-    type Item = io::Result<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(self.stdio.borrow_mut().input().read_u8())
+    fn read_line(&mut self) -> String {
+        self.terminal.act(terminal::Action::EnableRawMode).expect("Failed to enable raw mode");
+        let mut line = String::new();
+        loop {
+            if let terminal::Retrieved::Event(Some(terminal::Event::Key(key_event))) = self
+                .terminal
+                .get(terminal::Value::Event(None))
+                .expect("Error reading stdin")
+            {
+                match key_event.code {
+                    terminal::KeyCode::Enter => break,
+                    terminal::KeyCode::Char(ch) => line.push(ch),
+                    terminal::KeyCode::Backspace => drop(line.pop()),
+                    _ => (),
+                }
+            }
+        };
+        self.terminal.act(terminal::Action::DisableRawMode).expect("Failed to disable raw mode");
+        line
     }
 }
 
 trait RcIoPorts {
     type IO: IoPorts;
-    type Bytes: Iterator<Item = io::Result<u8>>;
-    type Chars: Iterator<Item = io::Result<char>>;
 
-    fn shared_reader(&self) -> Self::Bytes;
-    fn codepoints(&self) -> Self::Chars;
     fn port<P: IoPort<IO = Self::IO>>(&self, name: &'static str, p: P) -> IoPortWrapper<P>;
 }
 
 impl<IO: IoPorts> RcIoPorts for Rc<RefCell<IO>> {
     type IO = IO;
-    type Bytes = ShareReadBytes<IO>;
-    type Chars = CodePoints<ShareReadBytes<IO>>;
-
-    fn shared_reader(&self) -> Self::Bytes {
-        ShareReadBytes {
-            stdio: self.clone(),
-        }
-    }
-
-    fn codepoints(&self) -> Self::Chars {
-        CodePoints::from(self.shared_reader())
-    }
 
     fn port<P: IoPort<IO = IO>>(&self, name: &'static str, p: P) -> IoPortWrapper<P> {
         IoPortWrapper {
@@ -235,10 +245,7 @@ impl<P: IoPort> PortImpl for IoPortWrapper<P> {
     }
 }
 
-pub fn init(
-    ports: &mut [Option<Box<dyn PortImpl>>; 64],
-    (input, output): (impl BufRead + 'static, impl Write + 'static),
-) {
+pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl Write + 'static>) {
     macro_rules! port {
         ($port:ident) => {
             ports[Port::$port as usize]
@@ -247,37 +254,16 @@ pub fn init(
 
     let io = Rc::new(RefCell::new(ActualIoPorts {
         pending: None,
-        input,
-        output,
+        terminal,
     }));
-    let codepoints = Rc::new(RefCell::new(io.codepoints()));
     let numb_radix = Rc::new(RefCell::new(10u16));
 
-    port!(TSPECIAL) = Some(Box::new(io.port(
-        "TSPECIAL",
-        IoPortImpl {
-            io: io.clone(),
-            read: |mut io| {
-                vec![io
-                    .input()
-                    .fill_buf()
-                    .expect("Failed to read from stdin")
-                    .is_empty()]
-            },
-            write: |_, _| {
-                panic!("write to %TSPECIAL");
-            },
-        },
-    )));
     port!(TEXT) = Some(Box::new(io.port(
         "TEXT",
         IoPortImpl {
             io: io.clone(),
             read: |mut io| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let mut buf = vec![string.len() as u16];
                 buf.extend(string.bytes().map(u16::from));
                 buf
@@ -294,7 +280,7 @@ pub fn init(
                         .map(|w| w.expect("%TEXT received non-bytes"))
                         .collect();
                     let string = String::from_utf8(bytes).expect("%TEXT received invalid UTF-8");
-                    io.output()
+                    io.terminal()
                         .write_all(string.as_bytes())
                         .expect("Error writing stdout");
                     true
@@ -310,10 +296,7 @@ pub fn init(
             io: io.clone(),
             state: numb_radix.clone(),
             read: |mut io, numb_radix| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let num = u16::from_str_radix(&string, *numb_radix as u32)
                     .or_else(|_| i16::from_str_radix(&string, *numb_radix as u32).map(|n| n as u16))
                     .expect("Invalid number for %NUMB");
@@ -322,7 +305,7 @@ pub fn init(
             write: |mut io, numb_radix, words| {
                 assert_eq!(words.len(), 1);
                 let val: u16 = words[0].into();
-                io.output()
+                io.terminal()
                     .write_all(radix(val, *numb_radix as u8).to_string().as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -331,18 +314,13 @@ pub fn init(
     )));
     port!(ASCII8) = Some(Box::new(io.port(
         "ASCII8",
-        IoPortStateWrapper {
+        IoPortImpl {
             io: io.clone(),
-            state: codepoints.clone(),
-            read: |_, mut codepoints| {
-                let ch = codepoints
-                    .next()
-                    .expect("EOF")
-                    .expect("Error reading from stdin");
-                let val: u8 = ch.try_into().expect("Character out of ASCII8 range");
+            read: |mut io| {
+                let val: u8 = io.char().try_into().expect("Character out of ASCII8 range");
                 iter::once(val as u16)
             },
-            write: |mut io, _, words| {
+            write: |mut io, words| {
                 assert_eq!(words.len(), 1);
                 let val: u16 = words[0].into();
                 if val > u8::MAX as u16 {
@@ -350,7 +328,7 @@ pub fn init(
                 }
                 let val = val as u8;
                 let ch = val as char;
-                io.output()
+                io.terminal()
                     .write_all(ch.encode_utf8(&mut vec![0; 4]).as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -359,28 +337,24 @@ pub fn init(
     )));
     port!(ASCII7) = Some(Box::new(io.port(
         "ASCII7",
-        IoPortStateWrapper {
+        IoPortImpl {
             io: io.clone(),
-            state: codepoints.clone(),
-            read: |_, mut codepoints| {
-                let ch = codepoints
-                    .next()
-                    .expect("EOF")
-                    .expect("Error reading from stdin");
+            read: |mut io| {
+                let ch = io.char();
                 if !ch.is_ascii() {
                     panic!("Invalid character {ch} for %ASCII7");
                 }
                 let val: u8 = ch.try_into().unwrap();
                 iter::once(val as u16)
             },
-            write: |mut io, _, words| {
+            write: |mut io, words| {
                 assert_eq!(words.len(), 1);
                 let val: u16 = words[0].into();
                 let ch = std::char::from_u32(val as u32).expect("Invalid character");
                 if !ch.is_ascii() {
                     panic!("Invalid character {ch} for %ASCII7");
                 }
-                io.output()
+                io.terminal()
                     .write_all(ch.encode_utf8(&mut vec![0; 4]).as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -389,20 +363,16 @@ pub fn init(
     )));
     port!(UTF8) = Some(Box::new(io.port(
         "UTF8",
-        IoPortStateWrapper {
+        IoPortImpl {
             io: io.clone(),
-            state: codepoints.clone(),
-            read: |_, mut codepoints| {
-                let char = codepoints
-                    .next()
-                    .expect("EOF")
-                    .expect("Error reading from stdin");
+            read: |mut io| {
+                let char = io.char();
                 let mut buf = vec![0; 4];
                 let len = char.encode_utf8(&mut buf).len();
                 buf.truncate(len);
                 buf.into_iter().map(u16::from)
             },
-            write: |mut io, _, words| {
+            write: |mut io, words| {
                 assert!(!words.is_empty());
                 let bytes: Vec<u8> = words
                     .iter()
@@ -437,7 +407,7 @@ pub fn init(
                     }
                     let ch = std::char::from_u32(codepoint)
                         .expect("%UTF8 received an invalid codepoint");
-                    io.output()
+                    io.terminal()
                         .write_all(ch.encode_utf8(&mut vec![0; 4]).as_bytes())
                         .expect("Error writing stdout");
                     true
@@ -452,10 +422,7 @@ pub fn init(
             io: io.clone(),
             state: numb_radix.clone(),
             read: move |mut io, numb_radix| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let num = i16::from_str_radix(&string, *numb_radix as u32)
                     .expect("Invalid number for %INT");
                 iter::once(num)
@@ -463,7 +430,7 @@ pub fn init(
             write: |mut io, numb_radix, words| {
                 assert_eq!(words.len(), 1);
                 let val: i16 = words[0].into();
-                io.output()
+                io.terminal()
                     .write_all(radix(val, *numb_radix as u8).to_string().as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -477,10 +444,7 @@ pub fn init(
             io: io.clone(),
             state: numb_radix.clone(),
             read: |mut io, numb_radix| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let num = u16::from_str_radix(&string, *numb_radix as u32)
                     .expect("Invalid number for %UINT");
                 iter::once(num)
@@ -488,7 +452,7 @@ pub fn init(
             write: |mut io, numb_radix, words| {
                 assert_eq!(words.len(), 1);
                 let val: u16 = words[0].into();
-                io.output()
+                io.terminal()
                     .write_all(radix(val, *numb_radix as u8).to_string().as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -501,17 +465,14 @@ pub fn init(
         IoPortImpl {
             io: io.clone(),
             read: |mut io| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let num = u16::from_str_radix(&string, 2).expect("Invalid number for %BIN");
                 iter::once(num)
             },
             write: |mut io, words| {
                 assert_eq!(words.len(), 1);
                 let val: u16 = words[0].into();
-                io.output()
+                io.terminal()
                     .write_all(radix(val, 2).to_string().as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -524,17 +485,14 @@ pub fn init(
         IoPortImpl {
             io: io.clone(),
             read: |mut io| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let num = u16::from_str_radix(&string, 16).expect("Invalid number for %HEX");
                 iter::once(num)
             },
             write: |mut io, words| {
                 assert_eq!(words.len(), 1);
                 let val: u16 = words[0].into();
-                io.output()
+                io.terminal()
                     .write_all(radix(val, 16).to_string().as_bytes())
                     .expect("Error writing stdout");
                 true
@@ -547,17 +505,14 @@ pub fn init(
         IoPortImpl {
             io: io.clone(),
             read: |mut io| {
-                let mut string = String::new();
-                io.input()
-                    .read_line(&mut string)
-                    .expect("Error reading from stdin");
+                let string = io.read_line();
                 let num = f16::from_str(&string).expect("Invalid number for %FLOAT");
                 iter::once(num)
             },
             write: |mut io, words| {
                 assert_eq!(words.len(), 1);
                 let val: f16 = words[0].into();
-                io.output()
+                io.terminal()
                     .write_all(val.to_string().as_bytes())
                     .expect("Error writing stdout");
                 true

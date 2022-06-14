@@ -1,7 +1,7 @@
 use super::*;
 use derive_more::{Add, BitAnd, BitOr, BitXor, Neg, Not, Shl, Sub};
 use half::f16;
-use std::ops::{AddAssign, Index, IndexMut, Mul, Shl, SubAssign};
+use std::{ops::{AddAssign, Index, IndexMut, Mul, Shl, SubAssign}, fmt};
 
 // Sign-agnostic integer type which implements only the operators that do not care about sign.
 #[derive(Debug, Clone, Copy, Eq, Add, Sub, Not, Neg, BitAnd, BitOr, BitXor, Shl)]
@@ -124,6 +124,26 @@ pub struct VmState {
     pub ports: Ports,
 }
 
+impl VmMem {
+    pub fn get(&self, addr: Word) -> Option<Word> {
+        let index: usize = addr.into();
+        if index > self.mem.len() {
+            None
+        } else {
+            Some(self.mem[index])
+        }
+    }
+
+    pub fn get_mut(&mut self, addr: Word) -> Option<&mut Word> {
+        let index: usize = addr.into();
+        if index > self.mem.len() {
+            None
+        } else {
+            Some(&mut self.mem[index])
+        }
+    }
+}
+
 impl<T> Index<T> for VmMem
 where
     T: Into<usize>,
@@ -190,7 +210,7 @@ impl std::ops::IndexMut<Register> for Registers {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[allow(non_camel_case_types)]
 pub enum u4 {
@@ -239,7 +259,7 @@ impl From<u8> for u4 {
 #[derive(Debug, Clone, Copy)]
 #[repr(usize)]
 pub enum Register {
-    R0,
+    SP,
     R1,
     R2,
     R3,
@@ -254,13 +274,13 @@ pub enum Register {
     R12,
     R13,
     R14,
-    SP,
+    R15,
 }
 
 impl From<u4> for Register {
     fn from(val: u4) -> Self {
         match val {
-            u4::b_0000 => Register::R0,
+            u4::b_0000 => Register::SP,
             u4::b_0001 => Register::R1,
             u4::b_0010 => Register::R2,
             u4::b_0011 => Register::R3,
@@ -275,12 +295,12 @@ impl From<u4> for Register {
             u4::b_1100 => Register::R12,
             u4::b_1101 => Register::R13,
             u4::b_1110 => Register::R14,
-            u4::b_1111 => Register::SP,
+            u4::b_1111 => Register::R15,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Value {
     Register(Register),
     Immediate(Word),
@@ -295,5 +315,43 @@ impl From<Register> for Value {
 impl From<Word> for Value {
     fn from(i: Word) -> Self {
         Value::Immediate(i)
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Value::Register(r) => write!(f, "{r}"),
+            Value::Immediate(i) => write!(f, "{i}"),
+        }
+    }
+}
+
+impl fmt::Display for Register {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Register::SP => write!(f, "SP"),
+            Register::R1 => write!(f, "$1"),
+            Register::R2 => write!(f, "$2"),
+            Register::R3 => write!(f, "$3"),
+            Register::R4 => write!(f, "$4"),
+            Register::R5 => write!(f, "$5"),
+            Register::R6 => write!(f, "$6"),
+            Register::R7 => write!(f, "$7"),
+            Register::R8 => write!(f, "$8"),
+            Register::R9 => write!(f, "$9"),
+            Register::R10 => write!(f, "$10"),
+            Register::R11 => write!(f, "$11"),
+            Register::R12 => write!(f, "$12"),
+            Register::R13 => write!(f, "$13"),
+            Register::R14 => write!(f, "$14"),
+            Register::R15 => write!(f, "$15"),
+        }
+    }
+}
+
+impl fmt::Display for Word {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "0x{:04x}", self.0)
     }
 }

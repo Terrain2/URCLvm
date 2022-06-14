@@ -8,7 +8,7 @@ IMM $2 1
 ADD $3 $1 $2
 BRL .end $3 $2
 OUT %NUMB $3
-OUT %TEXT 0xA
+OUT %ASCII7 '\n'
 MOV $1 $2
 MOV $2 $3
 JMP .loop

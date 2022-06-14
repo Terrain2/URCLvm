@@ -306,7 +306,7 @@ pub enum OrdinaryInstruction {
     SETE,
     SETC,
 
-    SETLE = 0b_0111_0000,
+    SETLE = 0b_0110_1000,
     SETGE,
     SSETLE,
     SSETGE,
