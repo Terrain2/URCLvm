@@ -263,6 +263,8 @@ fn main() {
         }
     }
 
+    let mut volatile_reg = None;
+
     loop {
         let imm_literal = imm_literal(source, lines.len());
         match cursor.node().kind() {
@@ -279,19 +281,22 @@ fn main() {
                     "string" => vec![Err(err!(@nopush value, "DW strings are not supported"))],
                     _ => vec![imm_literal(value).map(|imm| (value, imm))],
                 };
-                lines.push(Instruction::DW(
-                    values
-                        .into_iter()
-                        .filter_map(|imm| {
-                            imm.map_or_else(
-                                |err| {
-                                    errors.push(err);
-                                    None
-                                },
-                                Some,
-                            )
-                        })
-                        .collect(),
+                lines.push((
+                    cursor.node(),
+                    Instruction3op::DW(
+                        values
+                            .into_iter()
+                            .filter_map(|imm| {
+                                imm.map_or_else(
+                                    |err| {
+                                        errors.push(err);
+                                        None
+                                    },
+                                    Some,
+                                )
+                            })
+                            .collect(),
+                    ),
                 ));
             }
             "instruction" => {
@@ -300,7 +305,7 @@ fn main() {
                 }
                 #[derive(Clone, Copy)]
                 enum AnyOperand<'a> {
-                    Register(Register),
+                    Register(Option<Register>),
                     Immediate(AnyImmediate<'a>),
                     Port(Port),
                     Error,
@@ -312,10 +317,13 @@ fn main() {
                         (
                             operand,
                             match operand.kind() {
-                                "register" => AnyOperand::Register(
-                                    operand.text(source)[1..].try_into().unwrap(),
-                                ),
-                                "stack_pointer" => AnyOperand::Register(Register::SP),
+                                "register" => {
+                                    AnyOperand::Register(match &operand.text(source)[1..] {
+                                        "0" => None,
+                                        r => Some(r.try_into().unwrap()),
+                                    })
+                                }
+                                "stack_pointer" => AnyOperand::Register(Some(Register::SP)),
                                 "program_counter" => {
                                     err!(operand; AnyOperand::Error, "PC unsupported for now")
                                 }
@@ -348,9 +356,9 @@ fn main() {
                     (@operand $name:ident : reg) => {
                         match $name {
                             (_, AnyOperand::Register(reg)) => reg,
-                            (node, AnyOperand::Immediate(_)) => err!(node; Register::R0, "Invalid operand type, expected register, found immediate"),
-                            (node, AnyOperand::Port(_)) => err!(node; Register::R0, "Invalid operand type, expected register, found port"),
-                            (_, AnyOperand::Error) => Register::R0,
+                            (node, AnyOperand::Immediate(_)) => err!(node; None, "Invalid operand type, expected register, found immediate"),
+                            (node, AnyOperand::Port(_)) => err!(node; None, "Invalid operand type, expected register, found port"),
+                            (_, AnyOperand::Error) => None,
                         }
                     };
                     (@operand $name:ident : imm) => {
@@ -374,18 +382,22 @@ fn main() {
                         match $name {
                             (_, AnyOperand::Register(reg)) => Value::Register(reg),
                             (node, AnyOperand::Immediate(imm)) => Value::Immediate((node, imm)),
-                            (node, AnyOperand::Port(_)) => err!(node; Value::Immediate((node, AnyImmediate::Number(0))), "Invalid operand type, expected register or immediate, found port"),
-                            (node, AnyOperand::Error) => Value::Immediate((node, AnyImmediate::Number(0))),
+                            (node, AnyOperand::Port(_)) => err!(node; Value::Register(None), "Invalid operand type, expected register or immediate, found port"),
+                            (_, AnyOperand::Error) => Value::Register(None),
                         }
                     };
                     ($($opcode:ident$(($($name:ident : $type:ident),*))?,)*) => {
                         match (opcode, operands.as_slice()) {
+                            ("@volatile", &[(_, AnyOperand::Register(Some(reg)))]) => {
+                                volatile_reg = Some(reg);
+                                None
+                            }
                             $(
                                 (stringify!($opcode), &[$($($name),*)?]) => {
                                     $(
                                     match_opcodes!(@operands operands $($name:$type)*);
                                     )?
-                                    Some(Instruction::$opcode$(($($name),*))?)
+                                    Some(Instruction3op::$opcode$(($($name),*))?)
                                 }
                                 (stringify!($opcode), &[..]) => {
                                     err!(cursor.node(); None, "Invalid number of operands for opcode `{opcode}`")
@@ -397,7 +409,7 @@ fn main() {
                         }
                     };
                 }
-                instructions!(match_opcodes).map(|inst| lines.push(inst));
+                instructions3!(match_opcodes).map(|inst| lines.push((cursor.node(), inst)));
             }
             _ => (),
         }
@@ -406,21 +418,36 @@ fn main() {
         }
     }
 
+    let volatile_reg = volatile_reg;
+
     let (line_offsets, total_size) = {
         let mut line_offsets = Vec::with_capacity(lines.len());
-        let mut offset = 0;
+        let mut total_size = 0;
 
-        for i in 0..lines.len() {
-            line_offsets.push(offset);
-            offset += lines[i].len();
+        for (node, inst) in lines.iter().cloned() {
+            match inst.map(|_| 0).lower(volatile_reg, total_size) {
+                Ok(insts) => {
+                    line_offsets.push(total_size);
+                    total_size += insts
+                        .into_iter()
+                        .map(|inst| inst.encode().len())
+                        .sum::<usize>() as u16;
+                }
+                Err(err) => {
+                    errors.push(SourceError {
+                        range: Some(node.range()),
+                        message: err.to_string(),
+                    });
+                }
+            }
         }
 
-        (line_offsets, offset)
+        (line_offsets, total_size)
     };
 
     let instructions = lines
         .into_iter()
-        .map(|inst| {
+        .map(|(_, inst)| {
             inst.map(|(node, imm)| match imm {
                 AnyImmediate::Macro("@BITS") => u16::BITS as u16,
                 AnyImmediate::Macro("@MINHEAP") => minheap,
@@ -505,19 +532,26 @@ fn main() {
     output
         .write_u16::<BigEndian>(minstack)
         .expect("Failed to write to output file");
-    for inst in instructions {
-        for word in inst.encode() {
-            output
-                .write_u16::<BigEndian>(word)
-                .expect("Failed to write to output file");
+    let mut size = 0;
+    for inst3 in instructions {
+        for inst2 in inst3
+            .lower(volatile_reg, size)
+            .expect("Error processing instructions after all errors should have been caught.")
+        {
+            for word in inst2.encode() {
+                output
+                    .write_u16::<BigEndian>(word)
+                    .expect("Failed to write to output file");
+                size += 1;
+            }
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum Register {
-    R0,
+    SP,
     R1,
     R2,
     R3,
@@ -532,18 +566,18 @@ pub enum Register {
     R12,
     R13,
     R14,
-    SP,
+    R15,
 }
 
 impl TryFrom<&str> for Register {
-    type Error = String;
+    type Error = Option<String>;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let idx = value
             .parse::<u16>()
             .expect("Failed to parse register index");
         match idx {
-            0 => Ok(Register::R0),
+            0 => Err(None),
             1 => Ok(Register::R1),
             2 => Ok(Register::R2),
             3 => Ok(Register::R3),
@@ -558,9 +592,10 @@ impl TryFrom<&str> for Register {
             12 => Ok(Register::R12),
             13 => Ok(Register::R13),
             14 => Ok(Register::R14),
-            15.. => Err(format!(
+            15 => Ok(Register::R15),
+            16.. => Err(Some(format!(
                 "Register ${idx} does not exist in URCLvm (only $0..$14 and SP)"
-            )),
+            ))),
         }
     }
 }
@@ -571,7 +606,7 @@ impl Into<u16> for Register {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AnyImmediate<'a> {
     Number(u16),
     Char(char),
@@ -581,29 +616,16 @@ enum AnyImmediate<'a> {
     Memory(u16),
 }
 
-#[derive(Clone, Copy)]
-pub enum Value<Imm> {
-    Register(Register),
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Value<Reg, Imm> {
+    Register(Reg),
     Immediate(Imm),
 }
 
-impl<Imm> Value<Imm> {
-    fn map<T, F>(self, f: &mut F) -> Value<T>
-    where
-        F: FnMut(Imm) -> T,
-    {
+impl<Reg, Imm> Value<Reg, Imm> {
+    fn map<I>(self, f: &mut impl FnMut(Imm) -> I) -> Value<Reg, I> {
         match self {
             Value::Register(r) => Value::Register(r),
-            Value::Immediate(i) => Value::Immediate(f(i)),
-        }
-    }
-
-    fn map_ref<T, F>(&self, f: F) -> Value<T>
-    where
-        F: FnOnce(&Imm) -> T,
-    {
-        match self {
-            Value::Register(r) => Value::Register(*r),
             Value::Immediate(i) => Value::Immediate(f(i)),
         }
     }
