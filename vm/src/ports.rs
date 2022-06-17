@@ -1,92 +1,75 @@
 use super::*;
 
 use derive_more::Display;
-use derive_try_from_primitive::TryFromPrimitive;
-use terminal::Terminal;
 use std::{
     cell::RefCell,
     io::{Read, Seek, SeekFrom, Write},
     ops::{Index, IndexMut},
     rc::Rc,
 };
+use terminal::Terminal;
 
 #[path = "io_ports.rs"]
 mod io_ports;
 
-#[derive(Clone, Copy, Debug, Display, TryFromPrimitive)]
-#[repr(u8)]
-pub enum Port {
-    // General
-    CPUBUS = 0,
-    TEXT = 1,
-    NUMB = 2,
-    SUPPORTED = 5,
-    SPECIAL = 6,
-    PROFILE = 7,
-    // Graphics
-    X = 8,
-    Y = 9,
-    COLOR = 10,
-    BUFFER = 11,
-    GSPECIAL = 15,
-    // Text
-    ASCII8 = 16,
-    CHAR5 = 17,
-    CHAR6 = 18,
-    ASCII7 = 19,
-    UTF8 = 20,
-    TSPECIAL = 23,
-    // Numbers
-    INT = 24,
-    UINT = 25,
-    BIN = 26,
-    HEX = 27,
-    FLOAT = 28,
-    FIXED = 29,
-    NSPECIAL = 31,
-    // Storage
-    ADDR = 32,
-    BUS = 33,
-    PAGE = 34,
-    SSPECIAL = 39,
-    // Miscellaneous
-    RNG = 40,
-    NOTE = 41,
-    INSTR = 42,
-    NLEG = 43,
-    WAIT = 44,
-    NADDR = 45,
-    DATA = 46,
-    MSPECIAL = 47,
-    // User defined
-    UD1 = 48,
-    UD2 = 49,
-    UD3 = 50,
-    UD4 = 51,
-    UD5 = 52,
-    UD6 = 53,
-    UD7 = 54,
-    UD8 = 55,
-    UD9 = 56,
-    UD10 = 57,
-    UD11 = 58,
-    UD12 = 59,
-    UD13 = 60,
-    UD14 = 61,
-    UD15 = 62,
-    UD16 = 63,
-}
+#[derive(Clone, Copy, Debug, Display)]
+pub struct Port(pub u8);
 
 pub struct Ports {
     ports: [Option<Box<dyn PortImpl>>; 64],
 }
 
+#[allow(dead_code)] // unused ports
+mod std_ports {
+    pub const CPUBUS: usize = 0;
+    pub const TEXT: usize = 1;
+    pub const NUMB: usize = 2;
+    pub const SUPPORTED: usize = 5;
+    pub const SPECIAL: usize = 6;
+    pub const PROFILE: usize = 7;
+    // Graphics
+    pub const X: usize = 8;
+    pub const Y: usize = 9;
+    pub const COLOR: usize = 10;
+    pub const BUFFER: usize = 11;
+    pub const GSPECIAL: usize = 15;
+    // Text
+    pub const ASCII8: usize = 16;
+    pub const CHAR5: usize = 17;
+    pub const CHAR6: usize = 18;
+    pub const ASCII7: usize = 19;
+    pub const UTF8: usize = 20;
+    pub const TSPECIAL: usize = 23;
+    // Numbers
+    pub const INT: usize = 24;
+    pub const UINT: usize = 25;
+    pub const BIN: usize = 26;
+    pub const HEX: usize = 27;
+    pub const FLOAT: usize = 28;
+    pub const FIXED: usize = 29;
+    pub const NSPECIAL: usize = 31;
+    // Storage
+    pub const ADDR: usize = 32;
+    pub const BUS: usize = 33;
+    pub const PAGE: usize = 34;
+    pub const SSPECIAL: usize = 39;
+    // Miscellaneous
+    pub const RNG: usize = 40;
+    pub const NOTE: usize = 41;
+    pub const INSTR: usize = 42;
+    pub const NLEG: usize = 43;
+    pub const WAIT: usize = 44;
+    pub const NADDR: usize = 45;
+    pub const DATA: usize = 46;
+    pub const MSPECIAL: usize = 47;
+}
+
 impl From<[Option<Box<dyn PortImpl>>; 64]> for Ports {
     fn from(mut ports: [Option<Box<dyn PortImpl>>; 64]) -> Self {
-        if let None = ports[Port::SUPPORTED as usize] {
+        if let None = ports[std_ports::SUPPORTED] {
             let mut supported = ports.each_ref().map(Option::is_some);
-            supported[Port::SUPPORTED as usize] = true;
-            ports[Port::SUPPORTED as usize] = Some(Box::new(SupportedPort(supported, None)));
+            supported[std_ports::SUPPORTED] = true;
+            ports[std_ports::SUPPORTED] = Some(Box::new(SupportedPort(supported, None)));
         }
         Ports { ports }
     }
@@ -95,7 +78,7 @@ impl From<[Option<Box<dyn PortImpl>>; 64]> for Ports {
 impl Index<Port> for Ports {
     type Output = Box<dyn PortImpl>;
 
-    fn index(&self, port: Port) -> &Self::Output {
+    fn index(&self, Port(port): Port) -> &Self::Output {
         match &self.ports[port as usize] {
             Some(port) => port,
             None => panic!("Usage of %{} is not supported", port),
@@ -104,7 +87,7 @@ impl Index<Port> for Ports {
 }
 
 impl IndexMut<Port> for Ports {
-    fn index_mut(&mut self, port: Port) -> &mut Self::Output {
+    fn index_mut(&mut self, Port(port): Port) -> &mut Self::Output {
         match &mut self.ports[port as usize] {
             Some(port) => port,
             None => panic!("Usage of %{} is not supported", port),
@@ -182,7 +165,7 @@ impl Ports {
 
         macro_rules! port {
             ($port:ident) => {
-                ports[Port::$port as usize]
+                ports[std_ports::$port]
             };
         }
 

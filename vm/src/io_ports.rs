@@ -248,7 +248,7 @@ impl<P: IoPort> PortImpl for IoPortWrapper<P> {
 pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl Write + 'static>) {
     macro_rules! port {
         ($port:ident) => {
-            ports[Port::$port as usize]
+            ports[std_ports::$port]
         };
     }
 

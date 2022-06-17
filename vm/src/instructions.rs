@@ -273,13 +273,9 @@ impl Instruction {
                     .then(|| {
                         let top2 = (op2 as u8 & 0b11) << 4;
                         match (((op2 as u8) >> 2) & 1 != 0, operand2) {
-                            (false, Value::Register(reg)) => Port::try_from(top2 | (reg as u8))
-                                .ok()
-                                .map(|port| (1, Instruction::IN(operand1, port))),
+                            (false, Value::Register(reg)) => Some((1, Instruction::IN(operand1, Port(top2 | (reg as u8))))),
                             (false, Value::Immediate(_)) => None,
-                            (true, source) => Port::try_from(top2 | (operand1 as u8))
-                                .ok()
-                                .map(|port| (len, Instruction::OUT(port, source))),
+                            (true, source) => Some((len, Instruction::OUT(Port(top2 | (operand1 as u8)), source))),
                         }
                     })
                     .map_or(None, std::convert::identity),
