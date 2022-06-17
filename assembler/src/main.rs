@@ -58,51 +58,123 @@ fn main() {
         .parse(source, None)
         .expect("Error in Parser::parse (unreachable?)");
 
-    let (volatile_reg, minheap, minstack, instructions) = compile(source, &tree).unwrap_or_else(|errors| {
-            let max_line_no_width = source.lines().count().to_string().len();
-            eprintln!();
-            for SourceError { range, message } in errors {
-                if let Some(tree_sitter::Range {
-                    start_point,
-                    end_point,
-                    ..
-                }) = range
-                {
-                    if start_point.row == end_point.row {
-                        let row = start_point.row + 1;
-                        let line = source
-                            .lines()
-                            .nth(start_point.row)
-                            .expect("Error printing errors");
-                        let start = start_point.column;
-                        let end = end_point.column;
-                        let err_pointer: String = iter::repeat(' ')
-                            .take(start)
-                            .chain(iter::repeat('^'))
-                            .take(end)
-                            .collect();
-                        const SPC: char = ' ';
+    macro_rules! ports {
+        ($($port:ident => $id:literal)*) => {
+            HashMap::from([
+                $((stringify!($port), Port($id)),)*
+            ])
+        }
+    }
+
+    let (volatile_reg, minheap, minstack, instructions) = compile(
+        source,
+        &tree,
+        ports! {
+            // General
+        CPUBUS => 0
+        TEXT => 1
+        NUMB => 2
+        SUPPORTED => 5
+        SPECIAL => 6
+        PROFILE => 7
+        // Graphics
+        X => 8
+        Y => 9
+        COLOR => 10
+        COLOUR => 10
+        BUFFER => 11
+        GSPECIAL => 15
+        // Text
+        ASCII8 => 16
+        CHAR5 => 17
+        CHAR6 => 18
+        ASCII7 => 19
+        UTF8 => 20
+        TSPECIAL => 23
+        // Numbers
+        INT => 24
+        UINT => 25
+        BIN => 26
+        HEX => 27
+        FLOAT => 28
+        FIXED => 29
+        NSPECIAL => 31
+        // Storage
+        ADDR => 32
+        BUS => 33
+        PAGE => 34
+        SSPECIAL => 39
+        // Miscellaneous
+        RNG => 40
+        NOTE => 41
+        INSTR => 42
+        NLEG => 43
+        WAIT => 44
+        NADDR => 45
+        DATA => 46
+        MSPECIAL => 47
+        // User defined
+        UD1 => 48
+        UD2 => 49
+        UD3 => 50
+        UD4 => 51
+        UD5 => 52
+        UD6 => 53
+        UD7 => 54
+        UD8 => 55
+        UD9 => 56
+        UD10 => 57
+        UD11 => 58
+        UD12 => 59
+        UD13 => 60
+        UD14 => 61
+        UD15 => 62
+        UD16 => 63
+        },
+    )
+    .unwrap_or_else(|errors| {
+        let max_line_no_width = source.lines().count().to_string().len();
+        eprintln!();
+        for SourceError { range, message } in errors {
+            if let Some(tree_sitter::Range {
+                start_point,
+                end_point,
+                ..
+            }) = range
+            {
+                if start_point.row == end_point.row {
+                    let row = start_point.row + 1;
+                    let line = source
+                        .lines()
+                        .nth(start_point.row)
+                        .expect("Error printing errors");
+                    let start = start_point.column;
+                    let end = end_point.column;
+                    let err_pointer: String = iter::repeat(' ')
+                        .take(start)
+                        .chain(iter::repeat('^'))
+                        .take(end)
+                        .collect();
+                    const SPC: char = ' ';
+                    eprintln!("{row:>max_line_no_width$} | {line}");
+                    eprintln!("{SPC:>max_line_no_width$}   {err_pointer}");
+                } else {
+                    let lines = source
+                        .lines()
+                        .enumerate()
+                        .skip(start_point.row)
+                        .take(end_point.row - start_point.row);
+                    for (row, line) in lines {
+                        let row = row + 1;
                         eprintln!("{row:>max_line_no_width$} | {line}");
-                        eprintln!("{SPC:>max_line_no_width$}   {err_pointer}");
-                    } else {
-                        let lines = source
-                            .lines()
-                            .enumerate()
-                            .skip(start_point.row)
-                            .take(end_point.row - start_point.row);
-                        for (row, line) in lines {
-                            let row = row + 1;
-                            eprintln!("{row:>max_line_no_width$} | {line}");
-                        }
                     }
                 }
-                eprintln!("{message}");
-                eprintln!();
             }
-            std::process::exit(1);
+            eprintln!("{message}");
+            eprintln!();
+        }
+        std::process::exit(1);
     });
-
-    
 
     let mut output = fs::File::create(args.output).expect("Failed to open output file");
     output
@@ -126,7 +198,9 @@ fn main() {
                     .write_u16::<BigEndian>(word)
                     .expect("Failed to write to output file");
                 if let Some(ref mut sourcemap) = sourcemap {
-                    sourcemap.write_u16::<BigEndian>(node.start_position().row as u16).expect("Failed to write to sourcemap file");
+                    sourcemap
+                        .write_u16::<BigEndian>(node.start_position().row as u16)
+                        .expect("Failed to write to sourcemap file");
                 }
                 size += 1;
             }
@@ -134,7 +208,19 @@ fn main() {
     }
 }
 
-fn compile<'a>(source: &'a str, tree: &'a Tree) -> Result<(Option<Register>, u16, u16, Vec<(Node<'a>, Instruction3op<u16>)>), Vec<SourceError>> {
+fn compile<'a>(
+    source: &'a str,
+    tree: &'a Tree,
+    ports: HashMap<&str, Port>,
+) -> Result<
+    (
+        Option<Register>,
+        u16,
+        u16,
+        Vec<(Node<'a>, Instruction3op<u16>)>,
+    ),
+    Vec<SourceError>,
+> {
     let mut errors = Vec::new();
     macro_rules! err {
         (@nopush None, $($arg:tt)*) => {
@@ -375,8 +461,19 @@ fn compile<'a>(source: &'a str, tree: &'a Tree) -> Result<(Option<Register>, u16
                                     err!(operand; AnyOperand::Error, "PC unsupported for now")
                                 }
                                 "port" => {
-                                    AnyOperand::Port(operand.text(source).try_into().unwrap())
-                                }
+                                    let name = &operand.text(source)[1..];
+                                    if let Some(id) = name
+                                        .parse::<u16>()
+                                        .ok()
+                                        .and_then(|id| (id < 64).then_some(id))
+                                    {
+                                        AnyOperand::Port(Port(id))
+                                    } else if let Some(&port) = ports.get(name) {
+                                        AnyOperand::Port(port)
+                                    } else {
+                                        err!(operand; AnyOperand::Error, "Unknown port: %{name}")
+                                    }
+                                },
                                 // could use filter_map here and have this arm return None
                                 // but this preserves operand count, which prevents false-positive incorrect number of args errors
                                 _ => imm_literal(operand).map_or_else(
@@ -417,12 +514,11 @@ fn compile<'a>(source: &'a str, tree: &'a Tree) -> Result<(Option<Register>, u16
                         }
                     };
                     (@operand $name:ident : port) => {
-                        // fuck it choose some port as the default for errors lol
                         match $name {
-                            (node, AnyOperand::Register(_)) => err!(node; Port::TEXT, "Invalid operand type, expected port, found register"),
-                            (node, AnyOperand::Immediate(_)) => err!(node; Port::TEXT, "Invalid operand type, expected port, found immediate"),
+                            (node, AnyOperand::Register(_)) => err!(node; Port(0), "Invalid operand type, expected port, found register"),
+                            (node, AnyOperand::Immediate(_)) => err!(node; Port(0), "Invalid operand type, expected port, found immediate"),
                             (_, AnyOperand::Port(port)) => port,
-                            (_, AnyOperand::Error) => Port::TEXT,
+                            (_, AnyOperand::Error) => Port(0),
                         }
                     };
                     (@operand $name:ident : val) => {
@@ -618,137 +714,14 @@ impl<Reg, Imm> Value<Reg, Imm> {
 }
 
 #[derive(Clone, Copy)]
-#[repr(u16)]
-pub enum Port {
-    // General
-    CPUBUS = 0,
-    TEXT = 1,
-    NUMB = 2,
-    SUPPORTED = 5,
-    SPECIAL = 6,
-    PROFILE = 7,
-    // Graphics
-    X = 8,
-    Y = 9,
-    COLOR = 10,
-    BUFFER = 11,
-    GSPECIAL = 15,
-    // Text
-    ASCII8 = 16,
-    CHAR5 = 17,
-    CHAR6 = 18,
-    ASCII7 = 19,
-    UTF8 = 20,
-    TSPECIAL = 23,
-    // Numbers
-    INT = 24,
-    UINT = 25,
-    BIN = 26,
-    HEX = 27,
-    FLOAT = 28,
-    FIXED = 29,
-    NSPECIAL = 31,
-    // Storage
-    ADDR = 32,
-    BUS = 33,
-    PAGE = 34,
-    SSPECIAL = 39,
-    // Miscellaneous
-    RNG = 40,
-    NOTE = 41,
-    INSTR = 42,
-    NLEG = 43,
-    WAIT = 44,
-    NADDR = 45,
-    DATA = 46,
-    MSPECIAL = 47,
-    // User defined
-    UD1 = 48,
-    UD2 = 49,
-    UD3 = 50,
-    UD4 = 51,
-    UD5 = 52,
-    UD6 = 53,
-    UD7 = 54,
-    UD8 = 55,
-    UD9 = 56,
-    UD10 = 57,
-    UD11 = 58,
-    UD12 = 59,
-    UD13 = 60,
-    UD14 = 61,
-    UD15 = 62,
-    UD16 = 63,
-}
+pub struct Port(u16);
 
 impl Port {
     fn upper(self) -> u16 {
-        self as u16 >> 4
+        self.0 >> 4
     }
 
     fn lower(self) -> u16 {
-        self as u16 & 0b1111
-    }
-}
-
-impl TryFrom<&str> for Port {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "%CPUBUS" => Ok(Port::CPUBUS),
-            "%TEXT" => Ok(Port::TEXT),
-            "%NUMB" => Ok(Port::NUMB),
-            "%SUPPORTED" => Ok(Port::SUPPORTED),
-            "%SPECIAL" => Ok(Port::SPECIAL),
-            "%PROFILE" => Ok(Port::PROFILE),
-            "%X" => Ok(Port::X),
-            "%Y" => Ok(Port::Y),
-            "%COLOR" | "%COLOUR" => Ok(Port::COLOR),
-            "%BUFFER" => Ok(Port::BUFFER),
-            "%GSPECIAL" => Ok(Port::GSPECIAL),
-            "%ASCII8" => Ok(Port::ASCII8),
-            "%CHAR5" => Ok(Port::CHAR5),
-            "%CHAR6" => Ok(Port::CHAR6),
-            "%ASCII7" => Ok(Port::ASCII7),
-            "%UTF8" => Ok(Port::UTF8),
-            "%TSPECIAL" => Ok(Port::TSPECIAL),
-            "%INT" => Ok(Port::INT),
-            "%UINT" => Ok(Port::UINT),
-            "%BIN" => Ok(Port::BIN),
-            "%HEX" => Ok(Port::HEX),
-            "%FLOAT" => Ok(Port::FLOAT),
-            "%FIXED" => Ok(Port::FIXED),
-            "%NSPECIAL" => Ok(Port::NSPECIAL),
-            "%ADDR" => Ok(Port::ADDR),
-            "%BUS" => Ok(Port::BUS),
-            "%PAGE" => Ok(Port::PAGE),
-            "%SSPECIAL" => Ok(Port::SSPECIAL),
-            "%RNG" => Ok(Port::RNG),
-            "%NOTE" => Ok(Port::NOTE),
-            "%INSTR" => Ok(Port::INSTR),
-            "%NLEG" => Ok(Port::NLEG),
-            "%WAIT" => Ok(Port::WAIT),
-            "%NADDR" => Ok(Port::NADDR),
-            "%DATA" => Ok(Port::DATA),
-            "%MSPECIAL" => Ok(Port::MSPECIAL),
-            "%UD1" => Ok(Port::UD1),
-            "%UD2" => Ok(Port::UD2),
-            "%UD3" => Ok(Port::UD3),
-            "%UD4" => Ok(Port::UD4),
-            "%UD5" => Ok(Port::UD5),
-            "%UD6" => Ok(Port::UD6),
-            "%UD7" => Ok(Port::UD7),
-            "%UD8" => Ok(Port::UD8),
-            "%UD9" => Ok(Port::UD9),
-            "%UD10" => Ok(Port::UD10),
-            "%UD11" => Ok(Port::UD11),
-            "%UD12" => Ok(Port::UD12),
-            "%UD13" => Ok(Port::UD13),
-            "%UD14" => Ok(Port::UD14),
-            "%UD15" => Ok(Port::UD15),
-            "%UD16" => Ok(Port::UD16),
-            _ => Err(format!("Unknown port {value}")),
-        }
+        self.0 & 0b1111
     }
 }
