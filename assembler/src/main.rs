@@ -5,7 +5,7 @@ use std::{collections::HashMap, fs, iter, path::PathBuf};
 
 use byteorder::{BigEndian, WriteBytesExt};
 use clap::Parser;
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -49,6 +49,7 @@ struct SourceError {
 fn main() {
     let args = Args::parse();
     let source = &fs::read_to_string(&args.input).expect("Failed to read input file");
+
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(tree_sitter_urcl::language())
@@ -57,6 +58,83 @@ fn main() {
         .parse(source, None)
         .expect("Error in Parser::parse (unreachable?)");
 
+    let (volatile_reg, minheap, minstack, instructions) = compile(source, &tree).unwrap_or_else(|errors| {
+            let max_line_no_width = source.lines().count().to_string().len();
+            eprintln!();
+            for SourceError { range, message } in errors {
+                if let Some(tree_sitter::Range {
+                    start_point,
+                    end_point,
+                    ..
+                }) = range
+                {
+                    if start_point.row == end_point.row {
+                        let row = start_point.row + 1;
+                        let line = source
+                            .lines()
+                            .nth(start_point.row)
+                            .expect("Error printing errors");
+                        let start = start_point.column;
+                        let end = end_point.column;
+                        let err_pointer: String = iter::repeat(' ')
+                            .take(start)
+                            .chain(iter::repeat('^'))
+                            .take(end)
+                            .collect();
+                        const SPC: char = ' ';
+                        eprintln!("{row:>max_line_no_width$} | {line}");
+                        eprintln!("{SPC:>max_line_no_width$}   {err_pointer}");
+                    } else {
+                        let lines = source
+                            .lines()
+                            .enumerate()
+                            .skip(start_point.row)
+                            .take(end_point.row - start_point.row);
+                        for (row, line) in lines {
+                            let row = row + 1;
+                            eprintln!("{row:>max_line_no_width$} | {line}");
+                        }
+                    }
+                }
+                eprintln!("{message}");
+                eprintln!();
+            }
+            std::process::exit(1);
+    });
+
+    
+
+    let mut output = fs::File::create(args.output).expect("Failed to open output file");
+    output
+        .write_u16::<BigEndian>(minheap)
+        .expect("Failed to write to output file");
+    output
+        .write_u16::<BigEndian>(minstack)
+        .expect("Failed to write to output file");
+    let mut sourcemap = args
+        .sourcemap
+        .map(fs::File::create)
+        .map(|f| f.expect("Failed to open sourcemap file"));
+    let mut size = 0;
+    for (node, inst3) in instructions {
+        for inst2 in inst3
+            .lower(volatile_reg, size)
+            .expect("Error processing instructions after all errors should have been caught.")
+        {
+            for word in inst2.encode() {
+                output
+                    .write_u16::<BigEndian>(word)
+                    .expect("Failed to write to output file");
+                if let Some(ref mut sourcemap) = sourcemap {
+                    sourcemap.write_u16::<BigEndian>(node.start_position().row as u16).expect("Failed to write to sourcemap file");
+                }
+                size += 1;
+            }
+        }
+    }
+}
+
+fn compile<'a>(source: &'a str, tree: &'a Tree) -> Result<(Option<Register>, u16, u16, Vec<(Node<'a>, Instruction3op<u16>)>), Vec<SourceError>> {
     let mut errors = Vec::new();
     macro_rules! err {
         (@nopush None, $($arg:tt)*) => {
@@ -449,78 +527,10 @@ fn main() {
             }))
         })
         .collect::<Vec<_>>();
-
-    if !errors.is_empty() {
-        let max_line_no_width = source.lines().count().to_string().len();
-        eprintln!();
-        for SourceError { range, message } in errors {
-            if let Some(tree_sitter::Range {
-                start_point,
-                end_point,
-                ..
-            }) = range
-            {
-                if start_point.row == end_point.row {
-                    let row = start_point.row + 1;
-                    let line = source
-                        .lines()
-                        .nth(start_point.row)
-                        .expect("Error printing errors");
-                    let start = start_point.column;
-                    let end = end_point.column;
-                    let err_pointer: String = iter::repeat(' ')
-                        .take(start)
-                        .chain(iter::repeat('^'))
-                        .take(end)
-                        .collect();
-                    const SPC: char = ' ';
-                    eprintln!("{row:>max_line_no_width$} | {line}");
-                    eprintln!("{SPC:>max_line_no_width$}   {err_pointer}");
-                } else {
-                    let lines = source
-                        .lines()
-                        .enumerate()
-                        .skip(start_point.row)
-                        .take(end_point.row - start_point.row);
-                    for (row, line) in lines {
-                        let row = row + 1;
-                        eprintln!("{row:>max_line_no_width$} | {line}");
-                    }
-                }
-            }
-            eprintln!("{message}");
-            eprintln!();
-        }
-        std::process::exit(1);
-    }
-
-    let mut output = fs::File::create(args.output).expect("Failed to open output file");
-    output
-        .write_u16::<BigEndian>(minheap)
-        .expect("Failed to write to output file");
-    output
-        .write_u16::<BigEndian>(minstack)
-        .expect("Failed to write to output file");
-    let mut sourcemap = args
-        .sourcemap
-        .map(fs::File::create)
-        .map(|f| f.expect("Failed to open sourcemap file"));
-    let mut size = 0;
-    for (node, inst3) in instructions {
-        for inst2 in inst3
-            .lower(volatile_reg, size)
-            .expect("Error processing instructions after all errors should have been caught.")
-        {
-            for word in inst2.encode() {
-                output
-                    .write_u16::<BigEndian>(word)
-                    .expect("Failed to write to output file");
-                if let Some(ref mut sourcemap) = sourcemap {
-                    sourcemap.write_u16::<BigEndian>(node.start_position().row as u16).expect("Failed to write to sourcemap file");
-                }
-                size += 1;
-            }
-        }
+    if errors.is_empty() {
+        Ok((volatile_reg, minheap, minstack, instructions))
+    } else {
+        Err(errors)
     }
 }
 
