@@ -33,7 +33,9 @@ impl<W: Write> IoPorts for ActualIoPorts<W> {
     }
 
     fn char(&mut self) -> char {
-        self.terminal.act(terminal::Action::EnableRawMode).expect("Failed to enable raw mode");
+        self.terminal
+            .act(terminal::Action::EnableRawMode)
+            .expect("Failed to enable raw mode");
         let ch = loop {
             if let terminal::Retrieved::Event(Some(terminal::Event::Key(key_event))) = self
                 .terminal
@@ -50,12 +52,16 @@ impl<W: Write> IoPorts for ActualIoPorts<W> {
                 }
             }
         };
-        self.terminal.act(terminal::Action::DisableRawMode).expect("Failed to disable raw mode");
+        self.terminal
+            .act(terminal::Action::DisableRawMode)
+            .expect("Failed to disable raw mode");
         ch
     }
 
     fn read_line(&mut self) -> String {
-        self.terminal.act(terminal::Action::EnableRawMode).expect("Failed to enable raw mode");
+        self.terminal
+            .act(terminal::Action::EnableRawMode)
+            .expect("Failed to enable raw mode");
         let mut line = String::new();
         loop {
             if let terminal::Retrieved::Event(Some(terminal::Event::Key(key_event))) = self
@@ -70,10 +76,17 @@ impl<W: Write> IoPorts for ActualIoPorts<W> {
                     _ => (),
                 }
             }
-        };
-        self.terminal.act(terminal::Action::DisableRawMode).expect("Failed to disable raw mode");
+        }
+        self.terminal
+            .act(terminal::Action::DisableRawMode)
+            .expect("Failed to disable raw mode");
         line
     }
+}
+
+enum WriteResult {
+    Finished,
+    MoreDataPls,
 }
 
 trait RcIoPorts {
@@ -97,7 +110,7 @@ impl<IO: IoPorts> RcIoPorts for Rc<RefCell<IO>> {
 trait IoPort {
     type IO: IoPorts;
     fn read(&mut self) -> Vec<Word>;
-    fn write(&mut self, words: &Vec<Word>) -> bool;
+    fn write(&mut self, words: &Vec<Word>) -> WriteResult;
     fn io(&mut self) -> RefMut<'_, Self::IO>;
 }
 
@@ -105,7 +118,7 @@ struct IoPortStateWrapper<IO: IoPorts, State, InT: IntoIterator, InF, OutF>
 where
     InT::Item: Into<Word>,
     InF: for<'a> FnMut(RefMut<'a, IO>, RefMut<'a, State>) -> InT,
-    OutF: for<'a> FnMut(RefMut<'a, IO>, RefMut<'a, State>, &'a Vec<Word>) -> bool,
+    OutF: for<'a> FnMut(RefMut<'a, IO>, RefMut<'a, State>, &'a Vec<Word>) -> WriteResult,
 {
     io: Rc<RefCell<IO>>,
     state: Rc<RefCell<State>>,
@@ -118,7 +131,7 @@ impl<IO: IoPorts, State, InT: IntoIterator, InF, OutF> IoPort
 where
     InT::Item: Into<Word>,
     InF: for<'a> FnMut(RefMut<'a, IO>, RefMut<'a, State>) -> InT,
-    OutF: for<'a> FnMut(RefMut<'a, IO>, RefMut<'a, State>, &'a Vec<Word>) -> bool,
+    OutF: for<'a> FnMut(RefMut<'a, IO>, RefMut<'a, State>, &'a Vec<Word>) -> WriteResult,
 {
     type IO = IO;
     fn read(&mut self) -> Vec<Word> {
@@ -128,7 +141,7 @@ where
             .collect()
     }
 
-    fn write(&mut self, words: &Vec<Word>) -> bool {
+    fn write(&mut self, words: &Vec<Word>) -> WriteResult {
         (self.write)(self.io.borrow_mut(), self.state.borrow_mut(), words)
     }
 
@@ -141,7 +154,7 @@ struct IoPortImpl<IO: IoPorts, InT: IntoIterator, InF, OutF>
 where
     InT::Item: Into<Word>,
     InF: for<'a> FnMut(RefMut<'a, IO>) -> InT,
-    OutF: for<'a> FnMut(RefMut<'a, IO>, &'a Vec<Word>) -> bool,
+    OutF: for<'a> FnMut(RefMut<'a, IO>, &'a Vec<Word>) -> WriteResult,
 {
     io: Rc<RefCell<IO>>,
     read: InF,
@@ -152,7 +165,7 @@ impl<IO: IoPorts, InT: IntoIterator, InF, OutF> IoPort for IoPortImpl<IO, InT, I
 where
     InT::Item: Into<Word>,
     InF: for<'a> FnMut(RefMut<'a, IO>) -> InT,
-    OutF: for<'a> FnMut(RefMut<'a, IO>, &'a Vec<Word>) -> bool,
+    OutF: for<'a> FnMut(RefMut<'a, IO>, &'a Vec<Word>) -> WriteResult,
 {
     type IO = IO;
     fn read(&mut self) -> Vec<Word> {
@@ -162,7 +175,7 @@ where
             .collect()
     }
 
-    fn write(&mut self, words: &Vec<Word>) -> bool {
+    fn write(&mut self, words: &Vec<Word>) -> WriteResult {
         (self.write)(self.io.borrow_mut(), words)
     }
 
@@ -236,7 +249,7 @@ impl<P: IoPort> PortImpl for IoPortWrapper<P> {
             }
             PendingIo::Write(ref mut pending) => {
                 pending.push(value);
-                if self.p.write(&pending) {
+                if let WriteResult::Finished = self.p.write(&pending) {
                     self.pending = PendingIo::None;
                     *self.p.io().pending() = None;
                 }
@@ -273,7 +286,9 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 let len = words.len() - 1;
                 let mut iwords = words.iter().copied();
                 let total_len: usize = iwords.next().unwrap().into();
-                if total_len == len {
+                if total_len != len {
+                    WriteResult::MoreDataPls
+                } else {
                     let bytes: Vec<u8> = iwords
                         .map(|w| w.into())
                         .map(|w: u16| u8::try_from(w))
@@ -283,9 +298,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                     io.terminal()
                         .write_all(string.as_bytes())
                         .expect("Error writing stdout");
-                    true
-                } else {
-                    false
+                    WriteResult::Finished
                 }
             },
         },
@@ -308,7 +321,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(radix(val, *numb_radix as u8).to_string().as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -331,7 +344,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(ch.encode_utf8(&mut vec![0; 4]).as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -357,7 +370,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(ch.encode_utf8(&mut vec![0; 4]).as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -389,7 +402,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                     _ => panic!("%UTF8 received invalid UTF-8: {:?}", bytes),
                 };
                 if bytes.len() < len {
-                    false
+                    WriteResult::MoreDataPls
                 } else {
                     let mut codepoint: u32 = match len {
                         1 => bytes[0] & 0b_01111111,
@@ -410,7 +423,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                     io.terminal()
                         .write_all(ch.encode_utf8(&mut vec![0; 4]).as_bytes())
                         .expect("Error writing stdout");
-                    true
+                    WriteResult::Finished
                 }
             },
         },
@@ -433,7 +446,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(radix(val, *numb_radix as u8).to_string().as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -455,7 +468,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(radix(val, *numb_radix as u8).to_string().as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -475,7 +488,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(radix(val, 2).to_string().as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -495,7 +508,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(radix(val, 16).to_string().as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
@@ -515,7 +528,7 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
                 io.terminal()
                     .write_all(val.to_string().as_bytes())
                     .expect("Error writing stdout");
-                true
+                WriteResult::Finished
             },
         },
     )));
