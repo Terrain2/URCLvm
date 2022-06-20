@@ -276,30 +276,22 @@ pub fn init(ports: &mut [Option<Box<dyn PortImpl>>; 64], terminal: Terminal<impl
         IoPortImpl {
             io: io.clone(),
             read: |mut io| {
-                let string = io.read_line();
-                let mut buf = vec![string.len() as u16];
-                buf.extend(string.bytes().map(u16::from));
-                buf
+                let ch = io.char() as u32;
+                if ch > u16::MAX as u32 {
+                    panic!("Invalid character for %TEXT (out of range)");
+                }
+                vec![ch as u16]
             },
             write: |mut io, words| {
-                assert!(!words.is_empty());
-                let len = words.len() - 1;
-                let mut iwords = words.iter().copied();
-                let total_len: usize = iwords.next().unwrap().into();
-                if total_len != len {
-                    WriteResult::MoreDataPls
-                } else {
-                    let bytes: Vec<u8> = iwords
-                        .map(|w| w.into())
-                        .map(|w: u16| u8::try_from(w))
-                        .map(|w| w.expect("%TEXT received non-bytes"))
-                        .collect();
-                    let string = String::from_utf8(bytes).expect("%TEXT received invalid UTF-8");
-                    io.terminal()
-                        .write_all(string.as_bytes())
-                        .expect("Error writing stdout");
-                    WriteResult::Finished
-                }
+                let ch: u16 = words[0].into();
+                let ch = char::try_from(ch as u32).unwrap_or_else(|_| {
+                    panic!("Invalid value {ch} for %TEXT (i think it's a surrogate pair?)")
+                });
+                let mut utf8 = [0; 4];
+                io.terminal()
+                    .write(ch.encode_utf8(&mut utf8).as_bytes())
+                    .expect("Error writing to stdout");
+                WriteResult::Finished
             },
         },
     )));
